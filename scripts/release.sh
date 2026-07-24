@@ -162,7 +162,10 @@ tar czf "$DIST/sendme-v${VERSION}-linux-amd64.tar.gz" \
     -C "target/$TARGET/release" sendme
 tar czf "$DIST/sendme-balloon-v${VERSION}-linux-amd64.tar.gz" \
     -C "target/$TARGET/release" sendme-balloon
-ok "tarballs packaged"
+
+# Generate checksums for the installer to verify
+(cd "$DIST" && sha256sum sendme-v${VERSION}-linux-amd64.tar.gz sendme-balloon-v${VERSION}-linux-amd64.tar.gz > SHA256SUMS)
+ok "tarballs and checksums packaged"
 
 # ── 8. Container image ────────────────────────────────────────────────────
 info "Building container image..."
@@ -197,7 +200,8 @@ gh release create "$TAG" \
     --title "$TAG" \
     --generate-notes \
     "$DIST/sendme-v${VERSION}-linux-amd64.tar.gz" \
-    "$DIST/sendme-balloon-v${VERSION}-linux-amd64.tar.gz"
+    "$DIST/sendme-balloon-v${VERSION}-linux-amd64.tar.gz" \
+    "$DIST/SHA256SUMS"
 ok "GitHub release created"
 
 # ── Done ───────────────────────────────────────────────────────────────────

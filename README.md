@@ -32,6 +32,37 @@ encrypted using TLS.
 
 # Installation
 
+## One-line install (Fedora Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/imp1sh/sendme-balloon/main/scripts/install.sh | bash
+```
+
+This downloads the latest release, verifies SHA256 checksums, and installs both
+binaries to `~/.local/bin` (or `/usr/local/bin` if run with `sudo`). A desktop
+entry and icon are created so `sendme-balloon` appears in your application
+launcher.
+
+For system-wide installation:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/imp1sh/sendme-balloon/main/scripts/install.sh | sudo bash
+```
+
+To uninstall:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/imp1sh/sendme-balloon/main/scripts/install.sh | bash -s -- --uninstall
+```
+
+To install a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/imp1sh/sendme-balloon/main/scripts/install.sh | bash -s -- --version 0.1.1
+```
+
+## Build from source
+
 The desktop app is gated behind the `balloon` feature, which is not enabled by
 default, so it has to be enabled explicitly:
 
