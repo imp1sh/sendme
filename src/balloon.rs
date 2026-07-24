@@ -346,3 +346,58 @@ async fn receive_ticket_inner(
     }
     res
 }
+
+// ── Autostart (desktop integration) ───────────────────────────────────────
+
+/// Path to the XDG autostart `.desktop` file (`~/.config/autostart/`).
+fn autostart_path() -> PathBuf {
+    let config = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    config.join("autostart").join("sendme-balloon.desktop")
+}
+
+/// The `.desktop` file content for autostart.
+fn autostart_desktop_entry(exec_path: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=sendme balloon\n\
+         Comment=Send and receive files over the internet\n\
+         Exec={exec_path}\n\
+         Icon=sendme-balloon\n\
+         Terminal=false\n\
+         Categories=Network;FileTransfer;\n\
+         StartupWMClass=sendme-balloon\n\
+         X-GNOME-Autostart-enabled=true\n"
+    )
+}
+
+/// Check whether autostart is currently enabled.
+pub fn autostart_is_enabled() -> bool {
+    autostart_path().exists()
+}
+
+/// Enable autostart by writing the `.desktop` file to the XDG autostart
+/// directory.  Returns the path on success.
+pub fn enable_autostart() -> anyhow::Result<PathBuf> {
+    let path = autostart_path();
+    let exec = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "sendme-balloon".to_string());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, autostart_desktop_entry(&exec))
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Disable autostart by removing the `.desktop` file.
+pub fn disable_autostart() -> anyhow::Result<()> {
+    let path = autostart_path();
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| anyhow::anyhow!("removing {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
