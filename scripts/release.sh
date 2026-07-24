@@ -6,8 +6,9 @@
 #   make release
 #   ./scripts/release.sh
 #
-# The script shows the current version, suggests the next patch version,
-# and asks you what the next version should be.  Then it does everything:
+# The script checks everything is in order, shows the current version,
+# suggests the next patch version, and asks you to confirm.  Then it does
+# everything:
 #   - bumps version, lints, tests
 #   - builds optimised binaries (CLI + balloon GUI)
 #   - packages tarballs
@@ -16,7 +17,6 @@
 #
 # Prerequisites (one-time):
 #   gh auth login
-#   podman login ghcr.io -u <github-username>
 #
 
 set -euo pipefail
@@ -46,43 +46,6 @@ bump_patch() {
     echo "${major}.${minor}.$((patch + 1))"
 }
 
-# ── Current version ─────────────────────────────────────────────────────────
-CURRENT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-SUGGESTED=$(bump_patch "$CURRENT_VERSION")
-
-echo ""
-printf "${B}sendme-balloon release${N}\n"
-printf "  Current version: ${G}%s${N}\n" "$CURRENT_VERSION"
-printf "  Suggested next:   %s\n" "$SUGGESTED"
-echo ""
-
-# ── Ask for the next version ───────────────────────────────────────────────
-while true; do
-    read -rp "Release version [${SUGGESTED}]: " VERSION
-    VERSION="${VERSION:-$SUGGESTED}"
-    VERSION="${VERSION#v}"  # strip leading 'v'
-
-    if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        printf "${R}Must be x.y.z (e.g. 0.1.0)${N}\n"
-        continue
-    fi
-
-    TAG="v${VERSION}"
-    if git rev-parse "$TAG" >/dev/null 2>&1; then
-        printf "${R}Tag %s already exists.${N}\n" "$TAG"
-        continue
-    fi
-    break
-done
-
-echo ""
-printf "${B}Releasing ${G}%s${N}${B} (tag %s)${N}\n" "$VERSION" "$TAG"
-echo ""
-
-# ── Confirm ────────────────────────────────────────────────────────────────
-read -rp "Proceed? [y/N] " confirm
-[[ "$confirm" =~ ^[Yy]$ ]] || die "aborted."
-
 # ── 1. Prerequisites ───────────────────────────────────────────────────────
 info "Checking prerequisites..."
 
@@ -111,7 +74,7 @@ GH_USER=$(gh api user --jq .login 2>/dev/null || echo "$REPO_OWNER")
 GH_TOKEN=$(gh auth token)
 echo "$GH_TOKEN" | podman login ghcr.io -u "$GH_USER" --password-stdin >/dev/null 2>&1 \
     || die "podman login to ghcr.io failed"
-ok "authenticated to GHCR as ${GH_USER}"
+ok "prerequisites satisfied"
 
 # ── 2. Repository state ────────────────────────────────────────────────────
 info "Validating repository state..."
@@ -128,13 +91,7 @@ REMOTE=$(git rev-parse origin/main)
 
 ok "on main, clean tree, in sync with origin"
 
-# ── 3. Version bump ────────────────────────────────────────────────────────
-info "Bumping version to ${VERSION}..."
-sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
-cargo update -p sendme --precise "$VERSION" 2>/dev/null || true
-ok "version bumped"
-
-# ── 4. Lint and test ────────────────────────────────────────────────────────
+# ── 3. Lint and test (before version bump so failure leaves no dirty tree) ─
 info "Linting..."
 cargo fmt --all -- --check
 ok "fmt clean"
@@ -146,7 +103,48 @@ info "Testing..."
 cargo test --all-features --bins --tests
 ok "tests pass"
 
-# ── 5. Build binaries ──────────────────────────────────────────────────────
+# ── 4. Ask for the next version ────────────────────────────────────────────
+CURRENT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+SUGGESTED=$(bump_patch "$CURRENT_VERSION")
+
+echo ""
+printf "${B}sendme-balloon release${N}\n"
+printf "  Current version: ${G}%s${N}\n" "$CURRENT_VERSION"
+printf "  Suggested next:   %s\n" "$SUGGESTED"
+echo ""
+
+while true; do
+    read -rp "Release version [${SUGGESTED}]: " VERSION
+    VERSION="${VERSION:-$SUGGESTED}"
+    VERSION="${VERSION#v}"  # strip leading 'v'
+
+    if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf "${R}Must be x.y.z (e.g. 0.1.0)${N}\n"
+        continue
+    fi
+
+    TAG="v${VERSION}"
+    if git rev-parse "$TAG" >/dev/null 2>&1; then
+        printf "${R}Tag %s already exists.${N}\n" "$TAG"
+        continue
+    fi
+    break
+done
+
+echo ""
+printf "${B}Releasing ${G}%s${N}${B} (tag %s)${N}\n" "$VERSION" "$TAG"
+echo ""
+
+read -rp "Proceed? [y/N] " confirm
+[[ "$confirm" =~ ^[Yy]$ ]] || die "aborted."
+
+# ── 5. Version bump ────────────────────────────────────────────────────────
+info "Bumping version to ${VERSION}..."
+sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
+cargo update -p sendme --precise "$VERSION" 2>/dev/null || true
+ok "version bumped"
+
+# ── 6. Build binaries ──────────────────────────────────────────────────────
 info "Building release binaries..."
 cargo build --release --target "$TARGET" --bin sendme
 ok "sendme built"
@@ -154,7 +152,7 @@ ok "sendme built"
 cargo build --release --features balloon --target "$TARGET" --bin sendme-balloon
 ok "sendme-balloon built"
 
-# ── 6. Package tarballs ───────────────────────────────────────────────────
+# ── 7. Package tarballs ───────────────────────────────────────────────────
 info "Packaging tarballs..."
 DIST="$ROOT_DIR/dist"
 rm -rf "$DIST"
@@ -166,7 +164,7 @@ tar czf "$DIST/sendme-balloon-v${VERSION}-linux-amd64.tar.gz" \
     -C "target/$TARGET/release" sendme-balloon
 ok "tarballs packaged"
 
-# ── 7. Container image ─────────────────────────────────────────────────────
+# ── 8. Container image ────────────────────────────────────────────────────
 info "Building container image..."
 GIT_SHA=$(git rev-parse --short HEAD)
 
@@ -183,7 +181,7 @@ podman push "${IMAGE}:latest"
 podman push "${IMAGE}:sha-${GIT_SHA}"
 ok "image pushed"
 
-# ── 8. Commit, tag, push, release ─────────────────────────────────────────
+# ── 9. Commit, tag, push, release ─────────────────────────────────────────
 info "Committing, tagging, and creating GitHub release..."
 
 git add Cargo.toml Cargo.lock
