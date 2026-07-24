@@ -91,7 +91,24 @@ command -v podman >/dev/null 2>&1 || die "podman not found — install: https://
 command -v gh     >/dev/null 2>&1 || die "gh CLI not found — install: https://cli.github.com/"
 
 gh auth status >/dev/null 2>&1 || die "gh not authenticated — run: gh auth login"
-ok "prerequisites satisfied"
+
+# Ensure gh has the write:packages scope needed to push to GHCR.
+SCOPE_OK=false
+while IFS= read -r line; do
+    [[ "$line" == *"write:packages"* ]] && SCOPE_OK=true
+done < <(gh auth status 2>&1)
+if [[ "$SCOPE_OK" != "true" ]]; then
+    info "Adding write:packages scope to gh token..."
+    gh auth refresh -s write:packages || die "failed to refresh gh token scope"
+fi
+
+# Auto-login to GHCR using the gh token — no manual podman login needed.
+info "Authenticating to GHCR..."
+GH_USER=$(gh api user --jq .login 2>/dev/null || echo "$REPO_OWNER")
+GH_TOKEN=$(gh auth token)
+echo "$GH_TOKEN" | podman login ghcr.io -u "$GH_USER" --password-stdin >/dev/null 2>&1 \
+    || die "podman login to ghcr.io failed"
+ok "authenticated to GHCR as ${GH_USER}"
 
 # ── 2. Repository state ────────────────────────────────────────────────────
 info "Validating repository state..."
