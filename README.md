@@ -290,9 +290,111 @@ tar xzf sendme-v0.1.0-linux-amd64.tar.gz
 
 ## Using the container image
 
+The container packages the `sendme` CLI only — the balloon GUI needs a display
+server and is not included. The image is based on `debian:bookworm-slim`,
+runs as a non-root user, and weighs about 99 MB.
+
+### Pull
+
 ```bash
 podman pull ghcr.io/imp1sh/sendme-balloon:latest
-podman run --rm -v "$PWD:/data" ghcr.io/imp1sh/sendme-balloon send /data/myfile
+# or a specific version:
+podman pull ghcr.io/imp1sh/sendme-balloon:0.1.1
+```
+
+### Send a file
+
+```bash
+podman run --rm -v "$PWD:/data" ghcr.io/imp1sh/sendme-balloon send /data/myfile.txt
+```
+
+The ticket is printed to stdout. Share it with the receiver.
+
+### Receive a file
+
+```bash
+podman run --rm -v "$PWD:/data" ghcr.io/imp1sh/sendme-balloon receive <ticket> /data
+```
+
+The downloaded file lands in `/data` (mapped to `$PWD` on the host).
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IROH_SECRET` | *(generated)* | The iroh secret key as 64 hex characters (32 bytes). Determines your node identity. If unset, a random one is generated for each run — set this for a stable identity. |
+| `RUST_LOG` | `warn` | Logging level (`error`, `warn`, `info`, `debug`, `trace`). |
+
+### Keeping a stable identity
+
+By default each container run generates a new random secret key, meaning a
+different node id every time. To keep a stable identity across runs, generate
+a key once and pass it via `IROH_SECRET`:
+
+```bash
+# Generate a key (do this once, save the output)
+KEY=$(openssl rand -hex 32)
+
+# Send with a stable identity
+podman run --rm -e IROH_SECRET="$KEY" -v "$PWD:/data" \
+    ghcr.io/imp1sh/sendme-balloon send /data/myfile.txt
+```
+
+### Passing CLI flags
+
+All CLI flags can be passed after the subcommand. The container's entrypoint
+is `sendme`, so the first argument is the subcommand:
+
+```bash
+# Disable relay servers (direct connections only)
+podman run --rm -v "$PWD:/data" \
+    ghcr.io/imp1sh/sendme-balloon send --relay disabled /data/myfile.txt
+
+# Use a custom relay server
+podman run --rm -v "$PWD:/data" \
+    ghcr.io/imp1sh/sendme-balloon send --relay https://my-relay.example.com /data/myfile.txt
+
+# Bind to a fixed port (useful for firewall rules)
+podman run --rm -p 1124:1124/udp -v "$PWD:/data" \
+    ghcr.io/imp1sh/sendme-balloon send --magic-ipv4-addr 0.0.0.0:1124 /data/myfile.txt
+
+# Suppress progress bars (useful in scripts/CI)
+podman run --rm -v "$PWD:/data" \
+    ghcr.io/imp1sh/sendme-balloon send --no-progress /data/myfile.txt
+
+# Verbose output
+podman run --rm -v "$PWD:/data" \
+    ghcr.io/imp1sh/sendme-balloon send -vv /data/myfile.txt
+```
+
+### Network considerations
+
+The CLI uses QUIC over UDP for peer-to-peer connections with NAT hole-punching.
+In a container this means:
+
+- **UDP must be allowed** — if you bind a fixed port with `--magic-ipv4-addr`,
+  map it with `-p <port>:<port>/udp`
+- **Relay fallback** — if direct hole-punching fails, traffic is relayed over
+  TCP (port 443), which works without any special port mapping
+- **No port needed for receiving** — the receiver connects outbound to the
+  sender, so no inbound ports are required
+
+### Complete reference
+
+```bash
+# Show help
+podman run --rm ghcr.io/imp1sh/sendme-balloon --help
+
+# Show version
+podman run --rm ghcr.io/imp1sh/sendme-balloon --version
+
+# Send a directory
+podman run --rm -v "$PWD:/data" \
+    ghcr.io/imp1sh/sendme-balloon send /data/myfolder/
+
+# Receive with a specific relay
+podman run --rm -e IROH_SECRET="$KEY" -v "$PWD:/data" \
+    ghcr.io/imp1sh/sendme-balloon receive --relay default <ticket> /data
 ```
 
 ## License
