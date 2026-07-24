@@ -92,6 +92,9 @@ command -v gh     >/dev/null 2>&1 || die "gh CLI not found — install: https://
 
 gh auth status >/dev/null 2>&1 || die "gh not authenticated — run: gh auth login"
 
+# Ensure gh knows which repo to use (avoids 'no default remote repository').
+gh repo set-default "${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || true
+
 # Ensure gh has the write:packages scope needed to push to GHCR.
 SCOPE_OK=false
 while IFS= read -r line; do
