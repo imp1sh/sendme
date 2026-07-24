@@ -348,14 +348,15 @@ async fn receive_ticket_inner(
 }
 
 // ── Autostart (desktop integration) ───────────────────────────────────────
+// Gated on the balloon feature because the `dirs` crate is optional.
 
-/// Path to the XDG autostart `.desktop` file (`~/.config/autostart/`).
+#[cfg(feature = "balloon")]
 fn autostart_path() -> PathBuf {
     let config = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     config.join("autostart").join("sendme-balloon.desktop")
 }
 
-/// The `.desktop` file content for autostart.
+#[cfg(feature = "balloon")]
 fn autostart_desktop_entry(exec_path: &str) -> String {
     format!(
         "[Desktop Entry]\n\
@@ -371,13 +372,12 @@ fn autostart_desktop_entry(exec_path: &str) -> String {
     )
 }
 
-/// Check whether autostart is currently enabled.
+#[cfg(feature = "balloon")]
 pub fn autostart_is_enabled() -> bool {
     autostart_path().exists()
 }
 
-/// Enable autostart by writing the `.desktop` file to the XDG autostart
-/// directory.  Returns the path on success.
+#[cfg(feature = "balloon")]
 pub fn enable_autostart() -> anyhow::Result<PathBuf> {
     let path = autostart_path();
     let exec = std::env::current_exe()
@@ -392,7 +392,7 @@ pub fn enable_autostart() -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-/// Disable autostart by removing the `.desktop` file.
+#[cfg(feature = "balloon")]
 pub fn disable_autostart() -> anyhow::Result<()> {
     let path = autostart_path();
     if path.exists() {
