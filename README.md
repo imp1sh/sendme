@@ -280,25 +280,95 @@ script does everything else:
 1. Bumps version in `Cargo.toml` and `Cargo.lock`
 2. Lints (`cargo fmt --check`, `cargo clippy -D warnings`) and tests — stops if
    anything fails
-3. Builds optimised binaries (`sendme` CLI + `sendme-balloon` GUI, amd64)
-4. Packages tarballs into `dist/`
+3. Builds **every target platform** via hermetic containers (see
+   [Cross-platform builds](#cross-platform-builds)): linux (gnu/musl, amd64 +
+   arm64), windows, macOS, FreeBSD
+4. Packages archives + a unified `SHA256SUMS` into `dist/`
 5. Builds and pushes the container image to GHCR (`:version`, `:latest`,
    `:sha-<hash>`)
 6. Commits, tags, and pushes to `origin`
-7. Creates a GitHub Release with auto-generated changelog and tarball downloads
+7. Creates a GitHub Release with auto-generated changelog and all archives as
+   downloads
 
 When it finishes, the release is live:
 
 - **Downloads**: https://github.com/imp1sh/sendme-balloon/releases
 - **Container**: `podman pull ghcr.io/imp1sh/sendme-balloon:<version>`
 
-## Using the released binaries
+## Cross-platform builds
 
-Download the tarball from the GitHub Releases page and extract it:
+All release targets are cross-compiled from an amd64 Linux host using hermetic
+containers — no target-platform toolchains need to be installed on the host.
+Each target builds inside a pinned container (`Dockerfile.cross`, Rust 1.91.0 +
+Zig 0.13.0 via `cargo-zigbuild`), so every build is reconstructible from the
+committed `Cargo.lock` + `Dockerfile.cross`, and BuildKit cache mounts keep
+incremental builds fast.
+
+### Target matrix
+
+| Target | Binary | Archive suffix |
+|--------|--------|-----------------|
+| `x86_64-unknown-linux-gnu` | CLI + GUI | `linux-amd64` |
+| `aarch64-unknown-linux-gnu` | CLI + GUI | `linux-arm64` |
+| `x86_64-unknown-linux-musl` | CLI only | `linux-musl-amd64` |
+| `aarch64-unknown-linux-musl` | CLI only | `linux-musl-arm64` |
+| `x86_64-pc-windows-gnu` | CLI + GUI | `windows-amd64` |
+| `x86_64-unknown-freebsd` | CLI only | `freebsd-amd64` |
+| `aarch64-unknown-freebsd` | CLI only | `freebsd-arm64` |
+| `x86_64-apple-darwin` | CLI + GUI | `darwin-amd64` |
+| `aarch64-apple-darwin` | CLI + GUI | `darwin-arm64` |
+
+List the matrix at any time:
 
 ```bash
+make build-list
+```
+
+### Build commands
+
+```bash
+make build-all                              # build every target → dist/staging/
+make dist                                   # build all + package archives + SHA256SUMS
+make build-target T=x86_64-unknown-linux-musl   # build one target
+```
+
+### macOS (darwin) targets
+
+darwin targets need the Apple macOS SDK, which you must obtain yourself (it
+cannot be redistributed). One-time setup:
+
+```bash
+make fetch-sdk X=~/Downloads/Xcode_15.4.xip
+```
+
+This extracts the SDK into `./sdks/MacOSX.sdk` (gitignored). If it is absent,
+darwin targets are skipped with a warning and the remaining platforms build
+normally.
+
+## Using the released binaries
+
+Download the archive for your platform from the GitHub Releases page and
+extract it:
+
+```bash
+# Linux (amd64, glibc)
 tar xzf sendme-v0.1.0-linux-amd64.tar.gz
 ./sendme send myfile.txt
+
+# Linux (amd64, static musl)
+tar xzf sendme-v0.1.0-linux-musl-amd64.tar.gz
+
+# macOS (Apple Silicon)
+tar xzf sendme-v0.1.0-darwin-arm64.tar.gz
+
+# Windows
+unzip sendme-v0.1.0-windows-amd64.zip
+```
+
+Always verify the checksum against the published `SHA256SUMS`:
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS
 ```
 
 ## Using the container image
