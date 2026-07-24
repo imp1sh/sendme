@@ -109,14 +109,18 @@ ok "fmt clean"
 cargo clippy --all-features --all-targets -- -D warnings
 ok "clippy clean"
 
-info "Testing..."
-# Capture all test output so subprocess eprintln!/progress bars can't
-# scramble the terminal.  Only shown on failure.
-TEST_OUTPUT=$(cargo test --all-features --bins --tests 2>&1) || {
-    echo "$TEST_OUTPUT"
-    die "tests failed"
-}
-ok "tests pass"
+if [[ "${SKIP_TESTS:-}" == "1" ]]; then
+    warn "skipping tests (SKIP_TESTS=1)"
+else
+    info "Testing..."
+    # Capture all test output so subprocess eprintln!/progress bars can't
+    # scramble the terminal.  Only shown on failure.
+    TEST_OUTPUT=$(cargo test --all-features --bins --tests 2>&1) || {
+        echo "$TEST_OUTPUT"
+        die "tests failed"
+    }
+    ok "tests pass"
+fi
 
 # ── 4. Ask for the next version ────────────────────────────────────────────
 CURRENT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
