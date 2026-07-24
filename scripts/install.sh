@@ -36,6 +36,7 @@ ACTION="install"
 SCOPE=""
 INSTALL_VERSION=""
 FORCE=false
+AUTOSTART=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -43,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --user)      SCOPE="user"; shift ;;
         --system)    SCOPE="system"; shift ;;
         --version)   INSTALL_VERSION="$2"; shift 2 ;;
+        --autostart) AUTOSTART=true; shift ;;
         --force)     FORCE=true; shift ;;
         --help|-h)
             cat <<USAGE
@@ -56,6 +58,7 @@ Options:
   --user            Install to ~/.local/bin (no root required)
   --system          Install to /usr/local/bin (requires root, default)
   --version <ver>   Install a specific version (default: latest)
+  --autostart       Enable start-at-login (creates XDG autostart entry)
   --force           Skip confirmation prompts
   --help            Show this help
 USAGE
@@ -120,6 +123,14 @@ do_uninstall() {
             removed=true
         fi
     done
+
+    # Remove autostart entry if present
+    AUTOSTART_FILE="${HOME}/.config/autostart/sendme-balloon.desktop"
+    if [[ -f "$AUTOSTART_FILE" ]]; then
+        rm -f "$AUTOSTART_FILE"
+        ok "removed autostart entry"
+        removed=true
+    fi
 
     # Refresh desktop database
     update-desktop-database -q "${APP_DIR}" 2>/dev/null || true
@@ -226,6 +237,25 @@ Categories=Network;FileTransfer;
 StartupWMClass=sendme-balloon
 DESKTOP
 ok "desktop entry created"
+
+# Autostart at login (--autostart flag or user can toggle later in the app)
+if [[ "$AUTOSTART" == true ]]; then
+    AUTOSTART_DIR="${HOME}/.config/autostart"
+    mkdir -p "$AUTOSTART_DIR"
+    cat > "${AUTOSTART_DIR}/sendme-balloon.desktop" <<AUTOSTART
+[Desktop Entry]
+Type=Application
+Name=sendme balloon
+Comment=Send and receive files over the internet
+Exec=${BIN_DIR}/sendme-balloon
+Icon=sendme-balloon
+Terminal=false
+Categories=Network;FileTransfer;
+StartupWMClass=sendme-balloon
+X-GNOME-Autostart-enabled=true
+AUTOSTART
+    ok "autostart at login enabled (${AUTOSTART_DIR}/sendme-balloon.desktop)"
+fi
 
 # Fedora-specific: restore SELinux contexts
 if [[ "$OS_ID" == "fedora" ]] && [[ "$SCOPE" == "system" ]]; then

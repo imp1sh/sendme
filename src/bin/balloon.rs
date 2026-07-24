@@ -32,8 +32,8 @@ use iroh::EndpointId;
 use iroh_blobs::ticket::BlobTicket;
 use sendme::balloon::{parse_ticket, receive_ticket, send_file, ReceiveEvent, SendEvent};
 use sendme::contacts::{
-    create_contact_endpoint, load_or_create_secret, run_accept_loop, send_offer, AddressBook,
-    Contact, IncomingOffer,
+    autostart_is_enabled, disable_autostart, enable_autostart, create_contact_endpoint,
+    load_or_create_secret, run_accept_loop, send_offer, AddressBook, Contact, IncomingOffer,
 };
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 #[cfg(target_os = "linux")]
@@ -171,6 +171,8 @@ struct BalloonApp {
     /// Text inputs for the add-contact form.
     add_contact_name: String,
     add_contact_node_id: String,
+    /// Whether autostart-at-login is currently enabled (cached at startup).
+    autostart_enabled: bool,
 }
 
 impl BalloonApp {
@@ -190,6 +192,7 @@ impl BalloonApp {
             pending_offer_respond: None,
             add_contact_name: String::new(),
             add_contact_node_id: String::new(),
+            autostart_enabled: autostart_is_enabled(),
         }
     }
 
@@ -873,6 +876,26 @@ impl BalloonApp {
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let before = self.autostart_enabled;
+                    ui.checkbox(&mut self.autostart_enabled, "Start at login");
+                    if self.autostart_enabled != before {
+                        if self.autostart_enabled {
+                            match enable_autostart() {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    self.autostart_enabled = false;
+                                    self.state = UiState::Error {
+                                        message: format!("cannot enable autostart: {e}"),
+                                    };
+                                }
+                            }
+                        } else {
+                            let _ = disable_autostart();
+                        }
+                    }
+                });
+                ui.add_space(4.0);
                 if self.address_book.contacts.is_empty() {
                     ui.label("(no contacts yet)");
                 } else {
@@ -1385,6 +1408,7 @@ mod tests {
                 pending_offer_respond: None,
                 add_contact_name: String::new(),
                 add_contact_node_id: String::new(),
+                autostart_enabled: false,
             },
             cmd_rx,
         )

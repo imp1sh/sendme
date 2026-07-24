@@ -61,6 +61,19 @@ To install a specific version:
 curl -fsSL https://raw.githubusercontent.com/imp1sh/sendme-balloon/main/scripts/install.sh | bash -s -- --version 0.1.1
 ```
 
+To install and enable start-at-login:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/imp1sh/sendme-balloon/main/scripts/install.sh | bash -s -- --autostart
+```
+
+Autostart can also be toggled at any time from inside the app — open the
+address book (round button on the balloon) and use the "Start at login"
+checkbox. This uses the XDG autostart standard (`~/.config/autostart/`) and
+works on GNOME, KDE Plasma, Cinnamon, MATE, XFCE, LXQt, and Sway. On bare
+tiling window managers like i3 or Hyprland, add `exec sendme-balloon` to your
+WM config manually.
+
 ## Build from source
 
 The desktop app is gated behind the `balloon` feature, which is not enabled by
