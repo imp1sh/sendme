@@ -76,7 +76,8 @@ fn send_recv_file() {
     )
     .dir(tgt_dir.path())
     .env_remove("RUST_LOG") // disable tracing
-    .stderr_to_stdout()
+    .stdout_capture()
+    .stderr_capture()
     .run()
     .unwrap();
     assert!(receive_output.status.success());
@@ -184,7 +185,8 @@ fn send_recv_dir() {
     )
     .dir(tgt_dir.path())
     .env_remove("RUST_LOG") // disable tracing
-    .stderr_to_stdout()
+    .stdout_capture()
+    .stderr_capture()
     .run()
     .unwrap();
     assert!(receive_output.status.success());
