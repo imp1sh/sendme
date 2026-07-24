@@ -1,0 +1,10 @@
+# Exclude everything not needed for the container build to keep the context
+# small and avoid invalidating Docker layer caches on unrelated changes.
+
+.git
+.github
+target
+*.md
+!README.md
+LICENSE-APACHE
+LICENSE-MIT

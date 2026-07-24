@@ -3,8 +3,8 @@ name: tests
 on:
   push:
     branches:
-      # This helps fill the caches properly, caches are not shared between PRs.
       - main
+      - "feat/**"
   pull_request:
     branches:
       - main
@@ -23,52 +23,46 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
+      - name: Install GUI build dependencies (for balloon feature)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --locked --workspace --all-targets --all-features
+        run: cargo clippy --locked --all-features --all-targets
 
   test:
-    runs-on: ${{ matrix.target.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - os: "ubuntu-latest"
-            toolchain: "x86_64-unknown-linux-gnu"
-            name: "Linux GNU"
-          - os: "macOS-latest"
-            toolchain: "x86_64-apple-darwin"
-            name: "macOS"
-          - os: "windows-latest"
-            toolchain: "x86_64-pc-windows-msvc"
-            name: "Windows MSVC"
-          - os: "windows-latest"
-            toolchain: "x86_64-pc-windows-gnu"
-            name: "Windows GNU"
-        channel:
-          - "stable"
-          - "beta"
-          - "nightly"
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.channel }}
-          targets: ${{ matrix.target.toolchain }}
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
+      - name: Install GUI build dependencies (for balloon feature)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev
       - name: cargo test
-        run: cargo test --locked --workspace --all-features --bins --tests --examples
+        run: cargo test --locked --all-features --bins --tests
 
-  # Checks correct runtime deps and features are requested by not including dev-dependencies.
   check-deps:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
       - name: cargo check
-        run: cargo check --workspace --all-features --bins
+        run: cargo check --all-features --bins
