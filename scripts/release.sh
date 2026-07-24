@@ -129,20 +129,20 @@ while true; do
     VERSION="${VERSION#v}"  # strip leading 'v'
 
     if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        printf "${R}Must be x.y.z (e.g. 0.1.0)${N}\n"
+        printf "%b\n" "${R}Must be x.y.z e.g. 0.1.0${N}"
         continue
     fi
 
     TAG="v${VERSION}"
     if git rev-parse "$TAG" >/dev/null 2>&1; then
-        printf "${R}Tag %s already exists.${N}\n" "$TAG"
+        printf "%b\n" "${R}Tag ${TAG} already exists.${N}"
         continue
     fi
     break
 done
 
 echo ""
-printf "${B}Releasing ${G}%s${N}${B} (tag %s)${N}\n" "$VERSION" "$TAG"
+printf "%b\n" "${B}Releasing ${G}${VERSION}${N}${B} tag ${TAG}${N}"
 echo ""
 
 read -rp "Proceed? [y/N] " confirm
