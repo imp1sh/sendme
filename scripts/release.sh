@@ -87,7 +87,17 @@ BRANCH="$(git branch --show-current)"
 git fetch origin --quiet
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse origin/main)
-[[ "$LOCAL" == "$REMOTE" ]] || die "local main is not in sync with origin — push or pull first"
+if [[ "$LOCAL" != "$REMOTE" ]]; then
+    AHEAD=$(git rev-list --count origin/main..HEAD)
+    BEHIND=$(git rev-list --count HEAD..origin/main)
+    if [[ "$AHEAD" -gt 0 && "$BEHIND" -eq 0 ]]; then
+        die "you have $AHEAD unpushed commit(s) on main — run: git push origin main"
+    elif [[ "$BEHIND" -gt 0 && "$AHEAD" -eq 0 ]]; then
+        die "local main is $BEHIND commit(s) behind origin — run: git pull"
+    else
+        die "local and origin/main have diverged ($AHEAD ahead, $BEHIND behind) — reconcile manually"
+    fi
+fi
 
 ok "on main, clean tree, in sync with origin"
 
