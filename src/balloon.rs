@@ -86,7 +86,11 @@ pub fn parse_ticket(input: &str) -> anyhow::Result<BlobTicket> {
 /// The transfer can be cancelled by sending to (or dropping) `cancel`.
 /// Terminates once the data was transferred completely to one peer, on
 /// cancellation, or on error.
-pub async fn send_file(path: PathBuf, events: mpsc::Sender<SendEvent>, cancel: oneshot::Receiver<()>) {
+pub async fn send_file(
+    path: PathBuf,
+    events: mpsc::Sender<SendEvent>,
+    cancel: oneshot::Receiver<()>,
+) {
     // use a temp dir for the blob store, it is removed again afterwards
     let suffix = rand::rng().random::<[u8; 16]>();
     let blobs_data_dir =

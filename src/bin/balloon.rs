@@ -24,16 +24,16 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Rect, RichText, Sense,
-    Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
+    self, Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Rect, RichText, Sense, Shape,
+    Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
+use indicatif::HumanBytes;
 use iroh::EndpointId;
 use iroh_blobs::ticket::BlobTicket;
-use indicatif::HumanBytes;
 use sendme::balloon::{parse_ticket, receive_ticket, send_file, ReceiveEvent, SendEvent};
 use sendme::contacts::{
-    AddressBook, Contact, IncomingOffer, create_contact_endpoint, load_or_create_secret,
-    run_accept_loop, send_offer,
+    create_contact_endpoint, load_or_create_secret, run_accept_loop, send_offer, AddressBook,
+    Contact, IncomingOffer,
 };
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 #[cfg(target_os = "linux")]
@@ -51,16 +51,22 @@ enum Command {
         size: u64,
     },
     CancelSend,
-    Receive { ticket: String },
+    Receive {
+        ticket: String,
+    },
     /// Begin receiving a ticket that arrived via an accepted offer.
-    ReceiveOffer { ticket: String },
+    ReceiveOffer {
+        ticket: String,
+    },
     CancelReceive,
 }
 
 /// Events from the background worker to the GUI.
 enum UiEvent {
     FilePickCancelled,
-    SendStarted { name: String },
+    SendStarted {
+        name: String,
+    },
     Send(SendEvent),
     TicketInvalid(String),
     FolderPickCancelled,
@@ -253,7 +259,11 @@ impl BalloonApp {
                 (
                     SendEvent::PeerConnected,
                     UiState::OfferPending {
-                        ticket, name, size, sent, ..
+                        ticket,
+                        name,
+                        size,
+                        sent,
+                        ..
                     },
                 ) => {
                     let ticket = ticket.clone();
@@ -698,14 +708,13 @@ impl BalloonApp {
                 ui.label(format!("{name} ({})", HumanBytes(size)));
                 ui.add_space(4.0);
                 ui.label("Ticket for the other side:");
-                egui::ScrollArea::vertical().max_height(60.0).show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(&ticket).monospace().size(10.0),
-                        )
-                        .wrap(),
-                    );
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(60.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&ticket).monospace().size(10.0)).wrap(),
+                        );
+                    });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy ticket").clicked() {
@@ -772,7 +781,10 @@ impl BalloonApp {
                         .hint_text("Ctrl+V to paste"),
                 );
                 if let Some(err) = &error {
-                    ui.colored_label(Color32::from_rgb(230, 90, 90), format!("invalid ticket: {err}"));
+                    ui.colored_label(
+                        Color32::from_rgb(230, 90, 90),
+                        format!("invalid ticket: {err}"),
+                    );
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -827,10 +839,7 @@ impl BalloonApp {
             UiState::ReceiveDone { target } => {
                 self.title_bar(ui, ctx, "🎈 Receive");
                 ui.add_space(8.0);
-                ui.colored_label(
-                    RECV_COLOR,
-                    format!("✓ saved to {}", target.display()),
-                );
+                ui.colored_label(RECV_COLOR, format!("✓ saved to {}", target.display()));
                 ui.add_space(8.0);
                 if ui.button("OK").clicked() {
                     self.state = UiState::Idle;
@@ -849,12 +858,14 @@ impl BalloonApp {
                 self.title_bar(ui, ctx, "📇 Contacts");
                 ui.label("Your node id (share with contacts):");
                 ui.add_space(2.0);
-                egui::ScrollArea::vertical().max_height(54.0).show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(&self.node_id).monospace().size(10.0))
-                            .wrap(),
-                    );
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(54.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&self.node_id).monospace().size(10.0))
+                                .wrap(),
+                        );
+                    });
                 ui.add_space(2.0);
                 if ui.button("📋 Copy my node id").clicked() {
                     ctx.copy_text(self.node_id.clone());
@@ -865,30 +876,28 @@ impl BalloonApp {
                 if self.address_book.contacts.is_empty() {
                     ui.label("(no contacts yet)");
                 } else {
-                    egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
-                        let mut to_remove: Option<String> = None;
-                        for c in &self.address_book.contacts {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&c.name).strong());
-                                ui.label(
-                                    RichText::new(short_id(&c.node_id))
-                                        .weak()
-                                        .size(10.0),
-                                );
-                                if ui
-                                    .small_button("🗑")
-                                    .on_hover_text("remove contact")
-                                    .clicked()
-                                {
-                                    to_remove = Some(c.node_id.clone());
-                                }
-                            });
-                        }
-                        if let Some(id) = to_remove {
-                            self.address_book.remove(&id);
-                            let _ = self.address_book.save();
-                        }
-                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(130.0)
+                        .show(ui, |ui| {
+                            let mut to_remove: Option<String> = None;
+                            for c in &self.address_book.contacts {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&c.name).strong());
+                                    ui.label(RichText::new(short_id(&c.node_id)).weak().size(10.0));
+                                    if ui
+                                        .small_button("🗑")
+                                        .on_hover_text("remove contact")
+                                        .clicked()
+                                    {
+                                        to_remove = Some(c.node_id.clone());
+                                    }
+                                });
+                            }
+                            if let Some(id) = to_remove {
+                                self.address_book.remove(&id);
+                                let _ = self.address_book.save();
+                            }
+                        });
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -954,27 +963,30 @@ impl BalloonApp {
                 sent,
             } => {
                 self.title_bar(ui, ctx, "📤 Send to");
-                ui.label(format!("Choose a contact for \"{name}\" ({}):", HumanBytes(size)));
+                ui.label(format!(
+                    "Choose a contact for \"{name}\" ({}):",
+                    HumanBytes(size)
+                ));
                 ui.add_space(6.0);
                 let mut chosen: Option<(EndpointId, String)> = None;
                 if self.address_book.contacts.is_empty() {
                     ui.label("(no contacts yet — add some in the address book)");
                 } else {
-                    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                        for c in &self.address_book.contacts {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&c.name).strong());
-                                ui.label(
-                                    RichText::new(short_id(&c.node_id)).weak().size(10.0),
-                                );
-                                if ui.button("Send").clicked() {
-                                    if let Ok(id) = c.endpoint_id() {
-                                        chosen = Some((id, c.name.clone()));
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for c in &self.address_book.contacts {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&c.name).strong());
+                                    ui.label(RichText::new(short_id(&c.node_id)).weak().size(10.0));
+                                    if ui.button("Send").clicked() {
+                                        if let Ok(id) = c.endpoint_id() {
+                                            chosen = Some((id, c.name.clone()));
+                                        }
                                     }
-                                }
-                            });
-                        }
-                    });
+                                });
+                            }
+                        });
                 }
                 ui.add_space(6.0);
                 if let Some((node_id, contact_name)) = chosen {
@@ -1034,9 +1046,7 @@ impl BalloonApp {
                 self.title_bar(ui, ctx, "📥 Incoming transfer");
                 ui.label(format!("{from_short} wants to send you:"));
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!("\"{name}\"  ({})", HumanBytes(size))).strong(),
-                );
+                ui.label(RichText::new(format!("\"{name}\"  ({})", HumanBytes(size))).strong());
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("✔ Accept").clicked() {
@@ -1249,19 +1259,16 @@ fn spawn_worker(
                             let evt_tx2 = evt_tx.clone();
                             let ctx2 = ctx.clone();
                             tokio::spawn(async move {
-                                let evt =
-                                    match send_offer(&ep, node_id, ticket, name, size).await {
-                                        Ok(true) => UiEvent::OfferAccepted,
-                                        Ok(false) => UiEvent::OfferRejected,
-                                        Err(e) => UiEvent::OfferError(format!("{e:#}")),
-                                    };
+                                let evt = match send_offer(&ep, node_id, ticket, name, size).await {
+                                    Ok(true) => UiEvent::OfferAccepted,
+                                    Ok(false) => UiEvent::OfferRejected,
+                                    Err(e) => UiEvent::OfferError(format!("{e:#}")),
+                                };
                                 let _ = evt_tx2.send(evt);
                                 ctx2.request_repaint();
                             });
                         }
-                        None => emit(UiEvent::OfferError(
-                            "contact endpoint unavailable".into(),
-                        )),
+                        None => emit(UiEvent::OfferError("contact endpoint unavailable".into())),
                     },
                     Command::CancelSend => {
                         if let Some(c) = cancel_send.take() {
@@ -1342,9 +1349,7 @@ fn main() -> eframe::Result {
     #[cfg(target_os = "linux")]
     let options = {
         let mut options = options;
-        if std::env::var_os("WAYLAND_DISPLAY").is_some()
-            && std::env::var_os("DISPLAY").is_some()
-        {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_some() {
             // winit 0.30 has no Wayland data-device support. XWayland provides
             // working Xdnd events on compositors such as Sway/wlroots.
             options.event_loop_builder = Some(Box::new(|builder| {

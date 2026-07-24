@@ -127,8 +127,9 @@ pub fn load_or_create_secret() -> anyhow::Result<SecretKey> {
     let path = secret_path();
     match std::fs::read_to_string(&path) {
         Ok(hex) => {
-            let bytes = hex::decode(hex.trim())
-                .map_err(|e| anyhow::anyhow!("secret key in {} is not valid hex: {e}", path.display()))?;
+            let bytes = hex::decode(hex.trim()).map_err(|e| {
+                anyhow::anyhow!("secret key in {} is not valid hex: {e}", path.display())
+            })?;
             let arr: [u8; 32] = bytes
                 .as_slice()
                 .try_into()
