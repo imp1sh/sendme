@@ -55,7 +55,7 @@ fn send_recv_file() {
     std::fs::write(&src_file, &data).unwrap();
     let mut send_cmd = duct::cmd(
         sendme_bin(),
-        ["send", src_file.as_os_str().to_str().unwrap()],
+        ["send", "--no-progress", src_file.as_os_str().to_str().unwrap()],
     )
     .dir(src_dir.path())
     .env_remove("RUST_LOG") // disable tracing
@@ -66,12 +66,15 @@ fn send_recv_file() {
     let output = String::from_utf8(output).unwrap();
     let ticket = output.split_ascii_whitespace().last().unwrap();
     let ticket = BlobTicket::from_str(ticket).unwrap();
-    let receive_output = duct::cmd(sendme_bin(), ["receive", &ticket.to_string()])
-        .dir(tgt_dir.path())
-        .env_remove("RUST_LOG") // disable tracing
-        .stderr_to_stdout()
-        .run()
-        .unwrap();
+    let receive_output = duct::cmd(
+        sendme_bin(),
+        ["receive", "--no-progress", &ticket.to_string()],
+    )
+    .dir(tgt_dir.path())
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_to_stdout()
+    .run()
+    .unwrap();
     assert!(receive_output.status.success());
     let tgt_file = tgt_dir.path().join(name);
     let tgt_data = std::fs::read(tgt_file).unwrap();
@@ -88,7 +91,7 @@ fn receive_closes_endpoint_no_iroh_socket_error() {
     std::fs::write(&src_file, &data).unwrap();
     let mut send_cmd = duct::cmd(
         sendme_bin(),
-        ["send", src_file.as_os_str().to_str().unwrap()],
+        ["send", "--no-progress", src_file.as_os_str().to_str().unwrap()],
     )
     .dir(src_dir.path())
     .env_remove("RUST_LOG")
@@ -99,13 +102,16 @@ fn receive_closes_endpoint_no_iroh_socket_error() {
     let output = String::from_utf8(output).unwrap();
     let ticket = output.split_ascii_whitespace().last().unwrap();
     let ticket = BlobTicket::from_str(ticket).unwrap();
-    let receive_output = duct::cmd(sendme_bin(), ["receive", &ticket.to_string()])
-        .dir(tgt_dir.path())
-        .env("RUST_LOG", "iroh::socket=error")
-        .stdout_capture()
-        .stderr_capture()
-        .run()
-        .unwrap();
+    let receive_output = duct::cmd(
+        sendme_bin(),
+        ["receive", "--no-progress", &ticket.to_string()],
+    )
+    .dir(tgt_dir.path())
+    .env("RUST_LOG", "iroh::socket=error")
+    .stdout_capture()
+    .stderr_capture()
+    .run()
+    .unwrap();
     assert!(receive_output.status.success(), "{receive_output:?}");
     let stderr = String::from_utf8_lossy(&receive_output.stderr);
     assert!(
@@ -149,7 +155,7 @@ fn send_recv_dir() {
     }
     let mut send_cmd = duct::cmd(
         sendme_bin(),
-        ["send", src_data_dir.as_os_str().to_str().unwrap()],
+        ["send", "--no-progress", src_data_dir.as_os_str().to_str().unwrap()],
     )
     .dir(src_dir.path())
     .env_remove("RUST_LOG") // disable tracing
@@ -160,10 +166,13 @@ fn send_recv_dir() {
     let output = String::from_utf8(output).unwrap();
     let ticket = output.split_ascii_whitespace().last().unwrap();
     let ticket = BlobTicket::from_str(ticket).unwrap();
-    let receive_output = duct::cmd(sendme_bin(), ["receive", &ticket.to_string()])
-        .dir(tgt_dir.path())
-        .env_remove("RUST_LOG") // disable tracing
-        .stderr_to_stdout()
+    let receive_output = duct::cmd(
+        sendme_bin(),
+        ["receive", "--no-progress", &ticket.to_string()],
+    )
+    .dir(tgt_dir.path())
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_to_stdout()
         .run()
         .unwrap();
     assert!(receive_output.status.success());
