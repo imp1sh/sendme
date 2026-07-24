@@ -142,55 +142,96 @@ On completion, it deletes the temp directory.
 
 All temp directories start with `.sendme-`.
 
-# Building & releasing
+# Development & release workflow
 
-The [Makefile](Makefile) wraps the common development and release workflow.
-Run `make` or `make help` for the full list of targets.
+## Prerequisites
 
-## Local development
+You need the following tools installed and configured before you can release:
 
+| Tool | Purpose | Setup |
+|------|---------|-------|
+| **Rust** | compile binaries | [rustup.rs](https://rustup.rs) |
+| **Docker** | build & push container image | [docs.docker.com](https://docs.docker.com/get-docker/) |
+| **gh CLI** | create GitHub releases with downloads | [cli.github.com](https://cli.github.com/) |
+
+One-time authentication (do this once, credentials are cached):
+
+```bash
+gh auth login                                                          # for GitHub releases
+echo "$GHCR_TOKEN" | docker login ghcr.io -u USERNAME --password-stdin  # for container registry
 ```
+
+The `GHCR_TOKEN` is a GitHub personal access token with `write:packages` scope.
+Create one at https://github.com/settings/tokens
+
+## Step 1 — develop on a feature branch
+
+```bash
+git checkout main
+git pull origin main
+git checkout -b feat/my-new-feature
+
+# develop, test, iterate ...
 make build              # debug CLI
 make build-balloon      # debug balloon GUI (needs GUI libs on Linux)
 make test               # all tests
 make lint               # fmt + clippy
 ```
 
-## Release binaries (amd64)
+## Step 2 — merge to main
 
-```
-make release            # optimised CLI binary
-make release-balloon    # optimised balloon GUI binary
-make release-all        # lint + test + both binaries
-make package            # tarball for distribution
-```
-
-## Release management
-
-```
-make bump-version V=0.37.0   # update Cargo.toml version
-git commit -am "bump to 0.37.0"
-make release-tag V=0.37.0    # tag + push (triggers CI)
+```bash
+git checkout main
+git pull origin main
+git merge --no-ff feat/my-new-feature
+git push origin main
 ```
 
-CI (`.github/workflows/release.yml`) fires on the tag, builds both amd64
-binaries, creates a GitHub Release with downloadable tarballs, and pushes the
-container image to GHCR.
+## Step 3 — release
 
-## Container image
+From a clean `main` that is in sync with `origin`, run:
 
-The container packages the `sendme` CLI (the balloon GUI needs a display
-server and is distributed as a direct binary download instead).
-
-```
-make docker-build      # build locally
-make docker-push       # push to ghcr.io/imp1sh/sendme-balloon
-make docker-run ARGS="send /data/file.txt"
+```bash
+make release V=0.1.0
 ```
 
-Pull from the registry:
+That single command runs `scripts/release.sh`, which automates the **entire**
+release lifecycle:
 
+1. **Validates prerequisites** — checks that `cargo`, `docker`, and `gh` are
+   installed and authenticated
+2. **Validates repository state** — ensures you are on `main`, the tree is
+   clean, local is in sync with `origin`, and the tag `v0.1.0` does not exist
+3. **Bumps version** — updates `Cargo.toml` and `Cargo.lock` to `0.1.0`
+4. **Lints and tests** — `cargo fmt --check`, `cargo clippy -D warnings`,
+   `cargo test` — the release fails if any of these fail
+5. **Builds binaries** — optimised `sendme` (CLI) and `sendme-balloon` (GUI)
+   for `x86_64-unknown-linux-gnu`
+6. **Packages tarballs** — `sendme-v0.1.0-linux-amd64.tar.gz` and
+   `sendme-balloon-v0.1.0-linux-amd64.tar.gz` in `dist/`
+7. **Builds and pushes container image** — tags `ghcr.io/imp1sh/sendme-balloon`
+   as `:0.1.0`, `:latest`, and `:sha-<git-hash>`, then pushes all three to GHCR
+8. **Commits, tags, and creates the release** — commits the version bump,
+   creates git tag `v0.1.0`, pushes both to `origin`, then creates a GitHub
+   Release with auto-generated changelog and the two tarballs as downloads
+
+When the script finishes, the release is live:
+
+- **Binaries**: https://github.com/imp1sh/sendme-balloon/releases/tag/v0.1.0
+- **Container**: `docker pull ghcr.io/imp1sh/sendme-balloon:0.1.0`
+
+## Using the released binaries
+
+Download the tarball from the GitHub Releases page and extract it:
+
+```bash
+tar xzf sendme-v0.1.0-linux-amd64.tar.gz
+./sendme send myfile.txt
 ```
+
+## Using the container image
+
+```bash
 docker pull ghcr.io/imp1sh/sendme-balloon:latest
 docker run --rm -v "$PWD:/data" ghcr.io/imp1sh/sendme-balloon send /data/myfile
 ```
