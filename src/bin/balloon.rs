@@ -1,7 +1,7 @@
 //! sendme balloon: a tiny desktop companion for sendme.
 //!
 //! Shows a little balloon hovering on the desktop (frameless, transparent
-//! window, Wayland compatible). The upper half of the balloon sends a file,
+//! window, Wayland/XWayland compatible). The upper half of the balloon sends a file,
 //! the lower half receives one.
 //!
 //! - Click the upper (blue) half: a file dialog opens, the chosen file is
@@ -24,10 +24,13 @@ use eframe::egui::{
 use indicatif::HumanBytes;
 use sendme::balloon::{parse_ticket, receive_ticket, send_file, ReceiveEvent, SendEvent};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
+#[cfg(target_os = "linux")]
+use winit::platform::x11::EventLoopBuilderExtX11;
 
 /// Commands from the GUI to the background worker.
 enum Command {
     PickAndSend,
+    SendPath(PathBuf),
     CancelSend,
     Receive { ticket: String },
     CancelReceive,
@@ -83,6 +86,7 @@ const SEND_COLOR_HOVER: Color32 = Color32::from_rgb(108, 160, 247);
 const RECV_COLOR: Color32 = Color32::from_rgb(52, 168, 83);
 const RECV_COLOR_HOVER: Color32 = Color32::from_rgb(94, 190, 120);
 const BUBBLE_BG: Color32 = Color32::from_rgb(32, 33, 36);
+const IDLE_SIZE: Vec2 = Vec2::new(164.0, 150.0);
 
 struct BalloonApp {
     state: UiState,
@@ -215,42 +219,51 @@ impl BalloonApp {
 
     fn desired_size(&self) -> Vec2 {
         match self.state {
-            UiState::Idle => Vec2::new(170.0, 240.0),
+            UiState::Idle => IDLE_SIZE,
             _ => Vec2::new(370.0, 250.0),
         }
     }
 
     /// The idle balloon: top half sends, bottom half receives.
     fn draw_balloon(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(170.0, 240.0), Sense::click_and_drag());
-        let center = Pos2::new(rect.center().x, rect.top() + 84.0);
-        let r = 66.0;
+        let (rect, resp) = ui.allocate_exact_size(IDLE_SIZE, Sense::click_and_drag());
+        let center = Pos2::new(rect.center().x, rect.top() + 72.0);
+        let r = 60.0;
         let in_circle = |p: Pos2| center.distance(p) <= r;
         let hover = resp.hover_pos();
-        let hover_top = hover.map(|p| in_circle(p) && p.y < center.y).unwrap_or(false);
-        let hover_bottom = hover.map(|p| in_circle(p) && p.y >= center.y).unwrap_or(false);
-        let send_col = if hover_top { SEND_COLOR_HOVER } else { SEND_COLOR };
-        let recv_col = if hover_bottom { RECV_COLOR_HOVER } else { RECV_COLOR };
+        let hover_top = hover
+            .map(|p| in_circle(p) && p.y < center.y)
+            .unwrap_or(false);
+        let hover_bottom = hover
+            .map(|p| in_circle(p) && p.y >= center.y)
+            .unwrap_or(false);
+        let files_hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        // Native file-drop events do not include coordinates, so the upper half
+        // is the drop target whenever a file is over this compact window.
+        let drop_hover = files_hovering;
+        let send_col = if hover_top {
+            SEND_COLOR_HOVER
+        } else {
+            SEND_COLOR
+        };
+        let recv_col = if hover_bottom {
+            RECV_COLOR_HOVER
+        } else {
+            RECV_COLOR
+        };
         let painter = ui.painter();
 
-        // string of the balloon (behind everything)
-        let knot_tip = Pos2::new(center.x, center.y + r + 10.0);
-        let n = 24;
-        let pts: Vec<Pos2> = (0..=n)
-            .map(|i| {
-                let t = i as f32 / n as f32;
-                Pos2::new(
-                    knot_tip.x + (t * std::f32::consts::TAU * 1.25).sin() * 9.0,
-                    knot_tip.y + t * (rect.bottom() - knot_tip.y - 4.0),
-                )
-            })
-            .collect();
-        painter.add(Shape::line(pts, Stroke::new(1.5, Color32::from_gray(120))));
+        painter.circle_filled(
+            center + Vec2::new(0.0, 3.0),
+            r + 2.0,
+            Color32::from_black_alpha(90),
+        );
 
-        // knot
+        // A small knot keeps the silhouette recognizable without wasting space on a string.
+        let knot_tip = Pos2::new(center.x, center.y + r + 9.0);
         let knot = vec![
-            Pos2::new(center.x - 8.0, center.y + r - 3.0),
-            Pos2::new(center.x + 8.0, center.y + r - 3.0),
+            Pos2::new(center.x - 7.0, center.y + r - 3.0),
+            Pos2::new(center.x + 7.0, center.y + r - 3.0),
             knot_tip,
         ];
         painter.add(Shape::convex_polygon(
@@ -274,29 +287,59 @@ impl BalloonApp {
         painter
             .with_clip_rect(bottom_half)
             .circle_filled(center, r, recv_col);
+        if drop_hover {
+            painter.with_clip_rect(top_half).circle_stroke(
+                center,
+                r - 4.0,
+                Stroke::new(3.0, Color32::WHITE),
+            );
+        }
         painter.line_segment(
             [
                 Pos2::new(center.x - r, center.y),
                 Pos2::new(center.x + r, center.y),
             ],
-            Stroke::new(2.0, Color32::WHITE),
+            Stroke::new(1.0, Color32::from_white_alpha(180)),
         );
-        painter.circle_stroke(center, r, Stroke::new(2.5, Color32::from_gray(40)));
+        painter.circle_stroke(center, r, Stroke::new(2.0, Color32::from_gray(35)));
+        painter.circle_filled(
+            Pos2::new(center.x - r * 0.38, center.y - r * 0.48),
+            5.0,
+            Color32::from_white_alpha(65),
+        );
 
         // labels
         painter.text(
-            Pos2::new(center.x, center.y - r * 0.45),
+            Pos2::new(center.x, center.y - 34.0),
             Align2::CENTER_CENTER,
-            "▲ Send",
+            if drop_hover { "Drop to send" } else { "Send" },
             FontId::proportional(16.0),
             Color32::WHITE,
         );
         painter.text(
-            Pos2::new(center.x, center.y + r * 0.45),
+            Pos2::new(center.x, center.y - 17.0),
             Align2::CENTER_CENTER,
-            "▼ Receive",
+            if drop_hover {
+                "release file"
+            } else {
+                "drop file or click"
+            },
+            FontId::proportional(10.0),
+            Color32::from_white_alpha(210),
+        );
+        painter.text(
+            Pos2::new(center.x, center.y + 27.0),
+            Align2::CENTER_CENTER,
+            "Receive",
             FontId::proportional(16.0),
             Color32::WHITE,
+        );
+        painter.text(
+            Pos2::new(center.x, center.y + 44.0),
+            Align2::CENTER_CENTER,
+            "paste a ticket",
+            FontId::proportional(10.0),
+            Color32::from_white_alpha(210),
         );
 
         // small close button, top right
@@ -319,6 +362,17 @@ impl BalloonApp {
         );
         if close_resp.clicked() {
             ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+
+        let dropped_path = ctx.input(|i| first_dropped_path(&i.raw.dropped_files));
+        if let Some(path) = dropped_path {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.state = UiState::Preparing { name };
+            self.send_cmd(Command::SendPath(path));
+            return;
         }
 
         // interactions: drag moves the window, click triggers an action
@@ -404,7 +458,7 @@ impl BalloonApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy ticket").clicked() {
-                        ctx.copy_text(format!("sendme receive {ticket}"));
+                        ctx.copy_text(ticket.clone());
                         self.copied_at = Some(Instant::now());
                     }
                     if self
@@ -577,6 +631,38 @@ impl eframe::App for BalloonApp {
     }
 }
 
+fn first_dropped_path(files: &[egui::DroppedFile]) -> Option<PathBuf> {
+    files.iter().find_map(|file| file.path.clone())
+}
+
+fn start_send(
+    path: PathBuf,
+    cancel_send: &mut Option<oneshot::Sender<()>>,
+    evt_tx: &std_mpsc::Sender<UiEvent>,
+    ctx: &egui::Context,
+) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    evt_tx.send(UiEvent::SendStarted { name }).ok();
+    ctx.request_repaint();
+
+    let (c_tx, c_rx) = oneshot::channel();
+    *cancel_send = Some(c_tx);
+    let (se_tx, mut se_rx) = tokio_mpsc::channel(64);
+    tokio::spawn(send_file(path, se_tx, c_rx));
+
+    let evt_tx = evt_tx.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        while let Some(e) = se_rx.recv().await {
+            evt_tx.send(UiEvent::Send(e)).ok();
+            ctx.request_repaint();
+        }
+    });
+}
+
 /// The background worker owns the tokio runtime and drives the actual
 /// sendme send/receive operations.
 fn spawn_worker(
@@ -605,27 +691,16 @@ fn spawn_worker(
                             .await;
                         match file {
                             None => emit(UiEvent::FilePickCancelled),
-                            Some(file) => {
-                                let path = file.path().to_path_buf();
-                                let name = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                emit(UiEvent::SendStarted { name });
-                                let (c_tx, c_rx) = oneshot::channel();
-                                cancel_send = Some(c_tx);
-                                let (se_tx, mut se_rx) = tokio_mpsc::channel(64);
-                                tokio::spawn(send_file(path, se_tx, c_rx));
-                                let evt_tx = evt_tx.clone();
-                                let ctx = ctx.clone();
-                                tokio::spawn(async move {
-                                    while let Some(e) = se_rx.recv().await {
-                                        evt_tx.send(UiEvent::Send(e)).ok();
-                                        ctx.request_repaint();
-                                    }
-                                });
-                            }
+                            Some(file) => start_send(
+                                file.path().to_path_buf(),
+                                &mut cancel_send,
+                                &evt_tx,
+                                &ctx,
+                            ),
                         }
+                    }
+                    Command::SendPath(path) => {
+                        start_send(path, &mut cancel_send, &evt_tx, &ctx);
                     }
                     Command::CancelSend => {
                         if let Some(c) = cancel_send.take() {
@@ -676,18 +751,49 @@ fn main() -> eframe::Result {
     tracing_subscriber::fmt::init();
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_inner_size([170.0, 240.0])
+            .with_inner_size(IDLE_SIZE)
             .with_decorations(false)
             .with_transparent(true)
+            .with_drag_and_drop(true)
             .with_always_on_top()
             .with_resizable(false)
             .with_app_id("sendme-balloon")
             .with_title("sendme balloon"),
         ..Default::default()
     };
+    #[cfg(target_os = "linux")]
+    let options = {
+        let mut options = options;
+        if std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && std::env::var_os("DISPLAY").is_some()
+        {
+            // winit 0.30 has no Wayland data-device support. XWayland provides
+            // working Xdnd events on compositors such as Sway/wlroots.
+            options.event_loop_builder = Some(Box::new(|builder| {
+                builder.with_x11();
+            }));
+        }
+        options
+    };
     eframe::run_native(
         "sendme balloon",
         options,
         Box::new(|cc| Ok(Box::new(BalloonApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_file_does_not_require_pointer_coordinates() {
+        let path = PathBuf::from("example.txt");
+        let files = vec![egui::DroppedFile {
+            path: Some(path.clone()),
+            ..Default::default()
+        }];
+
+        assert_eq!(first_dropped_path(&files), Some(path));
+    }
 }

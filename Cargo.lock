@@ -5428,6 +5428,7 @@ dependencies = [
  "tracing-subscriber",
  "walkdir",
  "windows-sys 0.61.2",
+ "winit",
 ]
 
 [[package]]

@@ -48,6 +48,9 @@ rfd = { version = "0.17", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.174", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", optional = true, features = ["x11"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"], optional = true }
 
@@ -59,7 +62,7 @@ tempfile = "3.8.1"
 
 [features]
 clipboard = ["dep:crossterm", "dep:windows-sys", "dep:libc"]
-balloon = ["dep:eframe", "dep:rfd"]
+balloon = ["dep:eframe", "dep:rfd", "dep:winit"]
 default = ["clipboard"]
 
 [[bin]]
