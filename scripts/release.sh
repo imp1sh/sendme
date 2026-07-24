@@ -29,6 +29,7 @@ else
 fi
 info()  { printf "${C}▶${N} %s\n" "$*"; }
 ok()    { printf "${G}✓${N} %s\n" "$*"; }
+warn()  { printf "${Y}⚠${N} %s\n" "$*"; }
 die()   { printf "${R}✗${N} %s\n" "$*" >&2; exit 1; }
 
 REPO_OWNER="imp1sh"
