@@ -30,7 +30,10 @@ use eframe::egui::{
 use indicatif::HumanBytes;
 use iroh::EndpointId;
 use iroh_blobs::ticket::BlobTicket;
-use sendme::balloon::{autostart_is_enabled, disable_autostart, enable_autostart, parse_ticket, receive_ticket, send_file, ReceiveEvent, SendEvent};
+use sendme::balloon::{
+    autostart_is_enabled, disable_autostart, enable_autostart, parse_ticket, receive_ticket,
+    send_file, ReceiveEvent, SendEvent,
+};
 use sendme::contacts::{
     create_contact_endpoint, load_or_create_secret, run_accept_loop, send_offer, AddressBook,
     Contact, IncomingOffer,
