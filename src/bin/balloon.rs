@@ -51,7 +51,7 @@ enum UiEvent {
 enum UiState {
     /// The plain balloon, waiting for a click.
     Idle,
-    /// The file open dialog is showing.
+    /// The file open dialog is showing and the balloon is hidden.
     PickingFile,
     /// The chosen file is being imported into the blob store.
     Preparing { name: String },
@@ -67,7 +67,7 @@ enum UiState {
     SendDone { name: String },
     /// Asking the user to paste a ticket.
     EnterTicket { error: Option<String> },
-    /// The folder picker dialog is showing.
+    /// The folder picker dialog is showing and the balloon is hidden.
     PickingFolder,
     /// Download in progress.
     Receiving {
@@ -124,7 +124,9 @@ impl BalloonApp {
                 }
             }
             UiEvent::SendStarted { name } => {
-                self.state = UiState::Preparing { name };
+                if matches!(self.state, UiState::PickingFile | UiState::Preparing { .. }) {
+                    self.state = UiState::Preparing { name };
+                }
             }
             UiEvent::Send(e) => match (e, &mut self.state) {
                 (
@@ -166,11 +168,13 @@ impl BalloonApp {
                 }
             }
             UiEvent::ReceiveStarting => {
-                self.state = UiState::Receiving {
-                    status: "connecting ...".into(),
-                    current: 0,
-                    total: 0,
-                };
+                if matches!(self.state, UiState::PickingFolder) {
+                    self.state = UiState::Receiving {
+                        status: "connecting ...".into(),
+                        current: 0,
+                        total: 0,
+                    };
+                }
             }
             UiEvent::Receive(e) => match (e, &mut self.state) {
                 (ReceiveEvent::Connecting, UiState::Receiving { status, .. }) => {
@@ -215,6 +219,19 @@ impl BalloonApp {
                 _ => {}
             },
         }
+    }
+
+    fn close_operation(&mut self) {
+        match &self.state {
+            UiState::PickingFile | UiState::Preparing { .. } | UiState::Waiting { .. } => {
+                self.send_cmd(Command::CancelSend);
+            }
+            UiState::PickingFolder | UiState::Receiving { .. } => {
+                self.send_cmd(Command::CancelReceive);
+            }
+            _ => {}
+        }
+        self.state = UiState::Idle;
     }
 
     fn desired_size(&self) -> Vec2 {
@@ -384,6 +401,7 @@ impl BalloonApp {
                 if in_circle(p) {
                     if p.y < center.y {
                         self.state = UiState::PickingFile;
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
                         self.send_cmd(Command::PickAndSend);
                     } else {
                         self.state = UiState::EnterTicket { error: None };
@@ -395,16 +413,18 @@ impl BalloonApp {
 
     /// Title bar of the bubble, acts as drag handle and shows a close button.
     fn title_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, title: &str) {
+        let mut close = false;
         let resp = ui
             .horizontal(|ui| {
                 ui.label(RichText::new(title).strong().size(16.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("✕").on_hover_text("quit").clicked() {
-                        ctx.send_viewport_cmd(ViewportCommand::Close);
-                    }
+                    close = ui.button("✕").on_hover_text("close").clicked();
                 });
             })
             .response;
+        if close {
+            self.close_operation();
+        }
         let drag = ui.interact(
             resp.rect.shrink2(Vec2::new(40.0, 0.0)),
             ui.id().with("drag"),
@@ -469,8 +489,7 @@ impl BalloonApp {
                         ui.colored_label(RECV_COLOR, "✓ copied");
                     }
                     if ui.button("Cancel").clicked() {
-                        self.send_cmd(Command::CancelSend);
-                        self.state = UiState::Idle;
+                        self.close_operation();
                     }
                 });
                 ui.add_space(6.0);
@@ -522,6 +541,7 @@ impl BalloonApp {
                     );
                     if ok.clicked() {
                         self.state = UiState::PickingFolder;
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
                         self.send_cmd(Command::Receive {
                             ticket: self.ticket_text.clone(),
                         });
@@ -560,8 +580,7 @@ impl BalloonApp {
                 }
                 ui.add_space(6.0);
                 if ui.button("Cancel").clicked() {
-                    self.send_cmd(Command::CancelReceive);
-                    self.state = UiState::Idle;
+                    self.close_operation();
                 }
             }
             UiState::ReceiveDone { target } => {
@@ -689,6 +708,7 @@ fn spawn_worker(
                             .set_title("sendme: choose a file to send")
                             .pick_file()
                             .await;
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                         match file {
                             None => emit(UiEvent::FilePickCancelled),
                             Some(file) => start_send(
@@ -708,12 +728,16 @@ fn spawn_worker(
                         }
                     }
                     Command::Receive { ticket } => match parse_ticket(&ticket) {
-                        Err(e) => emit(UiEvent::TicketInvalid(e.to_string())),
+                        Err(e) => {
+                            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                            emit(UiEvent::TicketInvalid(e.to_string()));
+                        }
                         Ok(ticket) => {
                             let dir = rfd::AsyncFileDialog::new()
                                 .set_title("sendme: choose where to save")
                                 .pick_folder()
                                 .await;
+                            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                             match dir {
                                 None => emit(UiEvent::FolderPickCancelled),
                                 Some(dir) => {
@@ -786,6 +810,22 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
 
+    fn app_in_state(state: UiState) -> (BalloonApp, tokio_mpsc::UnboundedReceiver<Command>) {
+        let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
+        let (_evt_tx, evt_rx) = std_mpsc::channel();
+        (
+            BalloonApp {
+                state,
+                ticket_text: String::new(),
+                copied_at: None,
+                last_size: Vec2::ZERO,
+                cmd_tx,
+                evt_rx,
+            },
+            cmd_rx,
+        )
+    }
+
     #[test]
     fn dropped_file_does_not_require_pointer_coordinates() {
         let path = PathBuf::from("example.txt");
@@ -795,5 +835,35 @@ mod tests {
         }];
 
         assert_eq!(first_dropped_path(&files), Some(path));
+    }
+
+    #[test]
+    fn closing_send_cancels_without_quitting() {
+        let (mut app, mut commands) = app_in_state(UiState::Waiting {
+            ticket: "ticket".into(),
+            name: "example.txt".into(),
+            size: 10,
+            peer: false,
+            sent: 0,
+        });
+
+        app.close_operation();
+
+        assert!(matches!(app.state, UiState::Idle));
+        assert!(matches!(commands.try_recv(), Ok(Command::CancelSend)));
+
+        app.apply(UiEvent::SendStarted {
+            name: "example.txt".into(),
+        });
+        assert!(matches!(app.state, UiState::Idle));
+    }
+
+    #[test]
+    fn cancelling_file_chooser_returns_to_idle_balloon() {
+        let (mut app, _) = app_in_state(UiState::PickingFile);
+
+        app.apply(UiEvent::FilePickCancelled);
+
+        assert!(matches!(app.state, UiState::Idle));
     }
 }
