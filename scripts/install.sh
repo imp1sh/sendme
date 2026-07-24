@@ -26,14 +26,15 @@ if [[ -t 1 ]]; then
 else
     B=''; G=''; R=''; Y=''; C=''; N=''
 fi
-info()  { printf "${C}▶${N} %s\n" "$*"; }
-ok()    { printf "${G}✓${N} %s\n" "$*"; }
-die()   { printf "${R}✗${N} %s\n" "$*" >&2; exit 1; }
+# %b interprets backslash escapes in the argument (so ${G} etc. render)
+info()  { printf "${C}▶${N} %b\n" "$*"; }
+ok()    { printf "${G}✓${N} %b\n" "$*"; }
+die()   { printf "${R}✗${N} %b\n" "$*" >&2; exit 1; }
 
 # ── Arguments ──────────────────────────────────────────────────────────────
 ACTION="install"
 SCOPE=""
-VERSION=""
+INSTALL_VERSION=""
 FORCE=false
 
 while [[ $# -gt 0 ]]; do
@@ -41,7 +42,7 @@ while [[ $# -gt 0 ]]; do
         --uninstall) ACTION="uninstall"; shift ;;
         --user)      SCOPE="user"; shift ;;
         --system)    SCOPE="system"; shift ;;
-        --version)   VERSION="$2"; shift 2 ;;
+        --version)   INSTALL_VERSION="$2"; shift 2 ;;
         --force)     FORCE=true; shift ;;
         --help|-h)
             cat <<USAGE
@@ -71,8 +72,11 @@ case "$ARCH" in
     *) die "unsupported architecture: $ARCH" ;;
 esac
 
+# Source /etc/os-release in a subshell to avoid clobbering our variables.
 OS_ID=""
-[[ -f /etc/os-release ]] && . /etc/os-release && OS_ID="${ID:-}"
+if [[ -f /etc/os-release ]]; then
+    OS_ID=$(bash -c '. /etc/os-release; echo "${ID:-}"')
+fi
 
 # ── Determine install scope and paths ──────────────────────────────────────
 if [[ -z "$SCOPE" ]]; then
@@ -118,11 +122,9 @@ do_uninstall() {
     done
 
     # Refresh desktop database
+    update-desktop-database -q "${APP_DIR}" 2>/dev/null || true
     if [[ "$SCOPE" == "system" ]]; then
-        update-desktop-database -q "${APP_DIR}" 2>/dev/null || true
         command -v restorecon >/dev/null 2>&1 && restorecon -R "${BIN_DIR}" 2>/dev/null || true
-    else
-        update-desktop-database -q "${APP_DIR}" 2>/dev/null || true
     fi
 
     if [[ "$removed" == true ]]; then
@@ -140,16 +142,16 @@ fi
 # ── Install ────────────────────────────────────────────────────────────────
 
 # Resolve version
-if [[ -z "$VERSION" ]]; then
+if [[ -z "$INSTALL_VERSION" ]]; then
     info "Finding latest release..."
     TAG=$(curl -fsSI "${GITHUB}/releases/latest" | grep -i "^location:" | sed 's|.*/tag/||' | tr -d '\r\n')
     [[ -n "$TAG" ]] || die "could not determine latest release"
-    VERSION="${TAG#v}"
+    INSTALL_VERSION="${TAG#v}"
 else
-    TAG="v${VERSION}"
+    TAG="v${INSTALL_VERSION}"
 fi
 
-info "Installing sendme-balloon ${G}${VERSION}${N} (${ARCH_TAG})"
+info "Installing sendme-balloon ${G}${INSTALL_VERSION}${N} (${ARCH_TAG})"
 
 # Create directories
 mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
@@ -161,8 +163,8 @@ trap cleanup EXIT
 
 # Download tarballs and checksums
 BASE_URL="${GITHUB}/releases/download/${TAG}"
-CLI_TARBALL="sendme-v${VERSION}-${ARCH_TAG}.tar.gz"
-GUI_TARBALL="sendme-balloon-v${VERSION}-${ARCH_TAG}.tar.gz"
+CLI_TARBALL="sendme-v${INSTALL_VERSION}-${ARCH_TAG}.tar.gz"
+GUI_TARBALL="sendme-balloon-v${INSTALL_VERSION}-${ARCH_TAG}.tar.gz"
 CHECKSUM_FILE="SHA256SUMS"
 
 info "Downloading..."
