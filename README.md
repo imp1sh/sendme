@@ -7,7 +7,13 @@
 
 
 **sendme-balloon** is a fork of [`n0-computer/sendme`](https://github.com/n0-computer/sendme). **sendme-balloon** is 
-maintained by [Jochen Demmer](mailto:jochen@winteltosh.de). The original project
+maintained by [Jochen Demmer](mailto:jochen@winteltosh.de). 
+
+BE WARNED
+All adjustments are fully vibe coded as an experiment. So far it seems to be working just fine.
+BE WARNED
+
+The original project
 is an example application using [iroh](https://crates.io/crates/iroh) with the
 [iroh-blobs](https://crates.io/crates/iroh-blobs) protocol to send files and
 directories over the internet; this fork focuses on the **balloon**, a tiny
