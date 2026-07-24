@@ -423,11 +423,20 @@ impl BalloonApp {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     if peer {
-                        ui.label(format!("peer connected, sent {}", HumanBytes(sent)));
+                        ui.label("peer connected, sending ...");
                     } else {
                         ui.label("waiting for the receiver ...");
                     }
                 });
+                if peer && size > 0 {
+                    let sent = sent.min(size);
+                    let frac = sent as f32 / size as f32;
+                    ui.add(egui::ProgressBar::new(frac).text(format!(
+                        "{} / {}",
+                        HumanBytes(sent),
+                        HumanBytes(size)
+                    )));
+                }
             }
             UiState::SendDone { name } => {
                 self.title_bar(ui, ctx, "🎈 Send");
