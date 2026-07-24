@@ -110,7 +110,12 @@ cargo clippy --all-features --all-targets -- -D warnings
 ok "clippy clean"
 
 info "Testing..."
-cargo test --all-features --bins --tests
+# Capture all test output so subprocess eprintln!/progress bars can't
+# scramble the terminal.  Only shown on failure.
+TEST_OUTPUT=$(cargo test --all-features --bins --tests 2>&1) || {
+    echo "$TEST_OUTPUT"
+    die "tests failed"
+}
 ok "tests pass"
 
 # ── 4. Ask for the next version ────────────────────────────────────────────
