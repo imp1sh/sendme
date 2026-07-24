@@ -144,6 +144,27 @@ rather than a store-and-forward mailbox.
   (X11) when both `WAYLAND_DISPLAY` and `DISPLAY` are present, which covers
   compositors such as Sway/wlroots.
 
+### Data storage
+
+The balloon persists its state in the user's configuration directory following
+the XDG Base Directory Specification (`$XDG_CONFIG_HOME` or `~/.config` on
+Linux):
+
+| Path | Purpose |
+|------|---------|
+| `~/.config/sendme-balloon/secret.key` | Your persistent iroh secret key (32 bytes, hex-encoded). Determines your stable 256-bit node id that others add to their address book. Generated automatically on first run. |
+| `~/.config/sendme-balloon/addressbook.json` | Your address book — a JSON array of contacts (nickname + node id). Created on first save. |
+
+The directory is created automatically on first use. To reset the app to a
+fresh state, delete the directory:
+
+```bash
+rm -rf ~/.config/sendme-balloon
+```
+
+Note that deleting `secret.key` changes your node id, so existing contacts
+would need to re-add you.
+
 ## Command-line usage
 
 ### Send side
