@@ -1,0 +1,290 @@
+name: release
+
+# ── DORMANT PIPELINE MODE ───────────────────────────────────────────────────
+# Releases are currently built on the developer's desktop via
+# scripts/release.sh (+ scripts/build.sh + Dockerfile.cross).  This workflow
+# is the FUTURE pipeline mode: kept here, validated, but NOT triggered
+# automatically.  When you are ready to move releases into CI, re-enable the
+# `push: tags` trigger below (uncomment it) and retire the build/ship steps
+# from scripts/release.sh (leave only validate → tag → push).
+#
+# Architecture (mirrors the desktop flow, on GitHub runners):
+#   • Native GitHub runners wherever they exist — best binary quality, fully
+#     licensed (macOS on Apple-sanctioned runners, Windows MSVC on Microsoft
+#     runners, Linux gnu on ubuntu amd64+arm64).
+#   • Hermetic container cross-builds only where no native runner exists:
+#     Linux musl and FreeBSD (CLI only), via Dockerfile.cross + cargo-zigbuild.
+#   • A parallel job builds & pushes the OCI image and signs it keyless.
+#   • A final job gathers every binary, packages versioned archives, emits a
+#     unified SHA256SUMS, signs it keyless (sigstore/cosign, GitHub OIDC — no
+#     long-lived keys anywhere), and creates the GitHub Release.
+#
+# Reconstructibility: the Rust toolchain is pinned to 1.91.0 in every job;
+# Cargo.lock is committed; the cross env is a version-controlled Dockerfile.
+# Security: signing is keyless via GitHub OIDC — no secrets to leak.
+
+on:
+  # Re-enable this block to activate automatic pipeline-mode releases:
+  # push:
+  #   tags:
+  #     - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to rerun the release for (e.g. v0.1.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: write   # create GitHub Release
+  packages: write   # push OCI image to GHCR
+  id-token: write   # keyless cosign signing via OIDC
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Native builds (macOS, Windows, Linux gnu) ────────────────────────────
+  build:
+    name: ${{ matrix.pkg }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux gnu — amd64
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  features: "",        bin: sendme,         pkg: sendme-x86_64-unknown-linux-gnu,        gui: false }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  features: "balloon", bin: sendme-balloon, pkg: sendme-balloon-x86_64-unknown-linux-gnu, gui: true  }
+          # Linux gnu — arm64 (native arm64 runner)
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, features: "",        bin: sendme,         pkg: sendme-aarch64-unknown-linux-gnu,       gui: false }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, features: "balloon", bin: sendme-balloon, pkg: sendme-balloon-aarch64-unknown-linux-gnu,gui: true  }
+          # Windows MSVC — amd64 (native, fully licensed)
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    features: "",        bin: sendme,         pkg: sendme-x86_64-pc-windows-msvc,           gui: false }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,    features: "balloon", bin: sendme-balloon, pkg: sendme-balloon-x86_64-pc-windows-msvc,  gui: true  }
+          # macOS — Intel (native, Apple-sanctioned runner)
+          - { os: macos-13,         target: x86_64-apple-darwin,       features: "",        bin: sendme,         pkg: sendme-x86_64-apple-darwin,             gui: false }
+          - { os: macos-13,         target: x86_64-apple-darwin,       features: "balloon", bin: sendme-balloon, pkg: sendme-balloon-x86_64-apple-darwin,     gui: true  }
+          # macOS — Apple Silicon (native)
+          - { os: macos-latest,     target: aarch64-apple-darwin,      features: "",        bin: sendme,         pkg: sendme-aarch64-apple-darwin,            gui: false }
+          - { os: macos-latest,     target: aarch64-apple-darwin,      features: "balloon", bin: sendme-balloon, pkg: sendme-balloon-aarch64-apple-darwin,     gui: true  }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.features }}
+
+      - name: Install GUI build deps (Linux balloon)
+        if: matrix.gui && startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev
+
+      - name: Build
+        shell: bash
+        run: |
+          FEAT=""
+          [[ -n "${{ matrix.features }}" ]] && FEAT="--features ${{ matrix.features }}"
+          cargo build --release --locked --target "${{ matrix.target }}" $FEAT --bin "${{ matrix.bin }}"
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          EXT=""
+          [[ "${{ matrix.os }}" == windows* ]] && EXT=".exe"
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}${EXT}" "staging/${{ matrix.bin }}${EXT}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg }}
+          path: staging/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── Container cross-builds (Linux musl, FreeBSD — CLI only) ───────────────
+  build-cross:
+    name: ${{ matrix.pkg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, pkg: sendme-x86_64-unknown-linux-musl }
+          - { target: aarch64-unknown-linux-musl, pkg: sendme-aarch64-unknown-linux-musl }
+          - { target: x86_64-unknown-freebsd,    pkg: sendme-x86_64-unknown-freebsd }
+          - { target: aarch64-unknown-freebsd,   pkg: sendme-aarch64-unknown-freebsd }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Cross-build (cargo-zigbuild in hermetic container)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.cross
+          build-args: TARGET=${{ matrix.target }}
+          cache-from: type=gha,scope=cross-${{ matrix.target }}
+          cache-to: type=gha,scope=cross-${{ matrix.target }},mode=max
+          outputs: type=local,dest=staging
+          push: false
+          load: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg }}
+          path: staging/sendme
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── OCI image (CLI) — build, push to GHCR, sign keyless ───────────────────
+  image:
+    name: container-image
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: rel
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then T="${{ github.event.inputs.tag }}"; else T="${{ github.ref_name }}"; fi
+          T="${T#v}"
+          echo "version=$T" >> "$GITHUB_OUTPUT"
+
+      - id: meta
+        run: |
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMG="ghcr.io/${REPO_LC}"
+          SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          {
+            echo "image=$IMG"
+            echo "version_tag=$IMG:${{ steps.rel.outputs.version }}"
+            echo "latest_tag=$IMG:latest"
+            echo "sha_tag=$IMG:sha-${SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.version_tag }}
+            ${{ steps.meta.outputs.latest_tag }}
+            ${{ steps.meta.outputs.sha_tag }}
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,scope=image,mode=max
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless, OIDC)
+        run: cosign sign --yes ${{ steps.meta.outputs.version_tag }}
+
+  # ── Aggregate: package, checksum, sign, publish ───────────────────────────
+  release:
+    name: publish
+    runs-on: ubuntu-latest
+    needs: [build, build-cross, image]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: rel
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then T="${{ github.event.inputs.tag }}"; else T="${{ github.ref_name }}"; fi
+          T="${T#v}"
+          echo "version=$T" >> "$GITHUB_OUTPUT"
+          echo "tag=v$T" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Package archives + SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          V="${{ steps.rel.outputs.version }}"
+
+          declare -A SUF=(
+            [x86_64-unknown-linux-gnu]=linux-amd64
+            [aarch64-unknown-linux-gnu]=linux-arm64
+            [x86_64-unknown-linux-musl]=linux-musl-amd64
+            [aarch64-unknown-linux-musl]=linux-musl-arm64
+            [x86_64-pc-windows-msvc]=windows-amd64
+            [x86_64-apple-darwin]=darwin-amd64
+            [aarch64-apple-darwin]=darwin-arm64
+            [x86_64-unknown-freebsd]=freebsd-amd64
+            [aarch64-unknown-freebsd]=freebsd-arm64
+          )
+
+          shopt -s nullglob
+          for d in */; do
+            pkg="${d%/}"
+            if [[ "$pkg" == sendme-balloon-* ]]; then
+              base=sendme-balloon; triple="${pkg#sendme-balloon-}"
+            else
+              base=sendme; triple="${pkg#sendme-}"
+            fi
+            suf="${SUF[$triple]:-UNKNOWN}"
+            out="${base}-v${V}-${suf}"
+            bin="$(find "$d" -maxdepth 1 -type f | head -1)"
+            fname="$(basename "$bin")"
+            if [[ "$triple" == *pc-windows* ]]; then
+              (cd "$d" && zip -X "../${out}.zip" "$fname")
+            else
+              (cd "$d" && tar czf "../${out}.tar.gz" "$fname")
+            fi
+          done
+
+          # Unified, sorted checksum file for all archives.
+          sha256sum *.tar.gz *.zip | sort -k2 > SHA256SUMS
+          echo "::group::Release artifacts"
+          ls -1 *.tar.gz *.zip SHA256SUMS
+          echo "::endgroup::"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums (keyless, OIDC)
+        run: |
+          cd dist
+          cosign sign-blob --yes \
+            --output-certificate SHA256SUMS.pem \
+            --output-signature SHA256SUMS.sig \
+            SHA256SUMS
+
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          TAG="${{ steps.rel.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" *.tar.gz *.zip SHA256SUMS SHA256SUMS.sig SHA256SUMS.pem --clobber
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes *.tar.gz *.zip SHA256SUMS SHA256SUMS.sig SHA256SUMS.pem
+          fi

@@ -36,6 +36,8 @@ help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## .*Test/ {printf "  $(GREEN)%-20s$(RESET) %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@printf "\n$(BOLD)Release:$(RESET)\n"
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## .*Release/ {printf "  $(GREEN)%-20s$(RESET) %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@printf "\n$(BOLD)Cross-platform:$(RESET)\n"
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## .*Cross/ {printf "  $(GREEN)%-20s$(RESET) %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@printf "\n$(BOLD)Container:$(RESET)\n"
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## .*Docker/ {printf "  $(GREEN)%-20s$(RESET) %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@printf "\n$(CYAN)Version: $(VERSION)$(RESET)\n"
@@ -94,6 +96,30 @@ build-release: ## Release — optimised CLI binary only (no release process)
 .PHONY: build-release-balloon
 build-release-balloon: ## Release — optimised balloon binary only (no release process)
 	cargo build --release --features balloon --target $(TARGET) --bin sendme-balloon
+
+# ── Cross-platform (hermetic container builds) ──────────────────────────────
+
+.PHONY: build-all
+build-all: ## Cross — build every target (linux/win/mac/freebsd) via containers
+	./scripts/build.sh
+
+.PHONY: dist
+dist: ## Cross — build all targets and package archives + SHA256SUMS
+	./scripts/build.sh --dist
+
+.PHONY: build-target
+build-target: ## Cross — build one target: make build-target T=x86_64-unknown-linux-musl
+	@[ -n "$(T)" ] || { echo "usage: make build-target T=<triple>"; exit 1; }
+	./scripts/build.sh --target $(T)
+
+.PHONY: build-list
+build-list: ## Cross — list the target matrix
+	./scripts/build.sh --list
+
+.PHONY: fetch-sdk
+fetch-sdk: ## Cross — obtain the macOS SDK for darwin builds: make fetch-sdk X=~/Xcode.xip
+	@[ -n "$(X)" ] || { echo "usage: make fetch-sdk X=<path-to-Xcode.xip>"; exit 1; }
+	./scripts/fetch-macos-sdk.sh --xip $(X)
 
 # ── Container ───────────────────────────────────────────────────────────────
 

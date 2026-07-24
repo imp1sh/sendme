@@ -1,0 +1,132 @@
+# syntax=docker/dockerfile:1
+#
+# sendme — hermetic cross-build environment
+#
+# One parametrised Dockerfile builds every release target on an amd64 Linux
+# host (your desktop).  cargo-zigbuild turns a single Zig toolchain into a
+# universal cross-linker, so the same image serves:
+#
+#   Linux  gnu/musl  (amd64, arm64)
+#   Windows gnu      (amd64)                 — MinGW via Zig
+#   FreeBSD          (amd64, arm64)
+#   macOS  darwin     (amd64, arm64)         — needs the Apple SDK (see below)
+#
+# The GUI (sendme-balloon) is built only for targets whose platform GUI
+# libraries are available in this image: Linux gnu, Windows gnu and macOS.
+# musl/FreeBSD get the CLI only.
+#
+# ── macOS SDK ──────────────────────────────────────────────────────────────
+# darwin targets require the Apple macOS SDK, which you must obtain yourself
+# (it is not and cannot be redistributed here).  Place the extracted SDK at
+#   ./sdks/MacOSX.sdk/
+# then build darwin targets with `--build-context applesdk=./sdks`.  See
+# scripts/build.sh and scripts/fetch-macos-sdk.sh for how to obtain the SDK.
+#
+# ── Manual build ───────────────────────────────────────────────────────────
+# Normally invoked by scripts/build.sh.  Manually:
+#
+#   podman build --build-arg TARGET=x86_64-unknown-linux-musl \
+#     -f Dockerfile.cross --output type=local,dest=out .
+#
+#   # macOS (needs SDK):
+#   podman build --build-arg TARGET=aarch64-apple-darwin \
+#     --build-arg CROSS_STAGE=darwin --build-context applesdk=./sdks \
+#     -f Dockerfile.cross --output type=local,dest=out .
+#
+# Valid TARGET values:
+#   x86_64-unknown-linux-gnu    aarch64-unknown-linux-gnu
+#   x86_64-unknown-linux-musl   aarch64-unknown-linux-musl
+#   x86_64-pc-windows-gnu       aarch64-pc-windows-gnu
+#   x86_64-unknown-freebsd      aarch64-unknown-freebsd
+#   x86_64-apple-darwin         aarch64-apple-darwin   (needs Apple SDK)
+#
+# Reconstructibility pins: Rust 1.91.0, Zig 0.13.0, Debian bookworm base,
+# Cargo.lock committed.  BuildKit cache mounts reuse compiled deps across runs.
+
+# ── Stage selector ─────────────────────────────────────────────────────────
+# CROSS_STAGE picks whether the Apple SDK is injected.  Defaults to `base`
+# (no SDK).  scripts/build.sh sets `darwin` for *-apple-darwin targets.
+ARG CROSS_STAGE=base
+
+# ── Bootstrap: toolchain + Zig (shared by every target) ────────────────────
+FROM rust:1.91-bookworm AS bootstrap
+ARG TARGET
+ARG ZIG_VERSION=0.13.0
+ENV CARGO_TERM_COLOR=never
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates xz-utils \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+    | tar -xJ -C /usr/local \
+ && ln -s "/usr/local/zig-linux-x86_64-${ZIG_VERSION}/zig" /usr/local/bin/zig
+
+RUN rustup default 1.91.0 \
+ && rustup component add rustfmt clippy \
+ && rustup target add "${TARGET}" \
+ # TODO(reconstructibility): pin cargo-zigbuild to a specific --version.
+ && cargo install --locked cargo-zigbuild
+
+# ── base: no Apple SDK (every target except darwin) ─────────────────────────
+FROM bootstrap AS base
+
+# ── darwin: inject the Apple SDK (provided via `applesdk` build context) ───
+# The SDK directory is COPY'd from the additional build context `applesdk`,
+# which scripts/build.sh points at ./sdks.  Non-darwin builds never enter
+# this stage, so the context is never required for them.
+FROM bootstrap AS darwin
+COPY --from=applesdk MacOSX.sdk /opt/MacOSX.sdk
+ENV SDKROOT=/opt/MacOSX.sdk \
+    DEVELOPER_DIR=/opt \
+    MACOSX_DEPLOYMENT_TARGET=11.0
+
+# ── builder: deps layer + real build ───────────────────────────────────────
+FROM ${CROSS_STAGE} AS builder
+ARG TARGET
+ARG FEATURES=""
+ARG NEED_GUI=false
+ARG BIN=sendme
+
+# GUI build deps (Linux gnu only).  Installed lazily so CLI-only targets
+# stay light and fast.
+RUN if echo "$TARGET" | grep -q -- '-unknown-linux-gnu$' && [ "$NEED_GUI" = "true" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev && \
+        rm -rf /var/lib/apt/lists/* ; \
+    fi
+
+# Dependency layer: seed dummy sources so deps resolve & compile (and cache)
+# before the real sources are copied.  Link may fail for exotic targets —
+# the `|| true` keeps the cached dependency graph regardless.
+COPY Cargo.toml Cargo.lock ./
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    mkdir -p src/bin \
+ && printf 'fn main() {}\n' > src/main.rs \
+ && printf 'fn main() {}\n' > src/bin/balloon.rs \
+ && ( if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then \
+          cargo build --release --locked --target "$TARGET" --bin "$BIN"; \
+      else \
+          cargo zigbuild --release --locked --target "$TARGET" --bin "$BIN"; \
+      fi ) || true
+
+# Real build.  The container's native triple (x86_64-unknown-linux-gnu) uses
+# plain `cargo build`; every other target uses `cargo zigbuild`.
+COPY src/ src/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    set -eux; \
+    FEAT=""; [ -n "$FEATURES" ] && FEAT="--features $FEATURES"; \
+    EXT=""; echo "$TARGET" | grep -q -- 'pc-windows' && EXT=".exe"; \
+    if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then \
+        cargo build --release --locked --target "$TARGET" $FEAT --bin "$BIN"; \
+    else \
+        cargo zigbuild --release --locked --target "$TARGET" $FEAT --bin "$BIN"; \
+    fi; \
+    cp "target/${TARGET}/release/${BIN}${EXT}" "/${BIN}${EXT}"
+
+# ── Artifact stage (consumed via `podman build --output type=local`) ────────
+FROM scratch AS artifact
+COPY --from=builder /sendme* /

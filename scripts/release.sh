@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 #
-# sendme-balloon — interactive release script
+# sendme-balloon — interactive release script (desktop, multi-platform)
 #
 # Usage:
 #   make release
 #   ./scripts/release.sh
 #
-# The script checks everything is in order, shows the current version,
-# suggests the next patch version, and asks you to confirm.  Then it does
-# everything:
-#   - bumps version, lints, tests
-#   - builds optimised binaries (CLI + balloon GUI)
-#   - packages tarballs
-#   - builds and pushes container image to GHCR
-#   - commits, tags, pushes, and creates a GitHub Release with downloads
+# Performs the FULL release on your amd64 Linux desktop:
+#   - validates repository state, lints, tests
+#   - asks for the next version, bumps Cargo.toml
+#   - builds EVERY target platform via hermetic containers (scripts/build.sh)
+#     → linux (gnu/musl, amd64/arm64), windows, macos, freebsd
+#   - packages archives + unified SHA256SUMS
+#   - builds & pushes the container image to GHCR
+#   - commits, tags, pushes, and creates a GitHub Release with all downloads
+#
+# macOS (darwin) targets need the Apple SDK at ./sdks/MacOSX.sdk — run
+# `make fetch-sdk X=<Xcode.xip>` once.  If absent, darwin targets are skipped
+# (the release proceeds with the remaining platforms).
 #
 # Prerequisites (one-time):
 #   gh auth login
+#   podman installed
 #
 
 set -euo pipefail
@@ -35,9 +40,9 @@ die()   { printf "${R}✗${N} %s\n" "$*" >&2; exit 1; }
 REPO_OWNER="imp1sh"
 REPO_NAME="sendme-balloon"
 IMAGE="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
-TARGET="x86_64-unknown-linux-gnu"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DIST="$ROOT_DIR/dist"
 cd "$ROOT_DIR"
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -56,7 +61,6 @@ command -v gh     >/dev/null 2>&1 || die "gh CLI not found — install: https://
 
 gh auth status >/dev/null 2>&1 || die "gh not authenticated — run: gh auth login"
 
-# Ensure gh knows which repo to use (avoids 'no default remote repository').
 gh repo set-default "${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || true
 
 # Ensure gh has the write:packages scope needed to push to GHCR.
@@ -114,8 +118,6 @@ if [[ "${SKIP_TESTS:-}" == "1" ]]; then
     warn "skipping tests (SKIP_TESTS=1)"
 else
     info "Testing..."
-    # Capture all test output so subprocess eprintln!/progress bars can't
-    # scramble the terminal.  Only shown on failure.
     TEST_OUTPUT=$(cargo test --all-features --bins --tests 2>&1) || {
         echo "$TEST_OUTPUT"
         die "tests failed"
@@ -154,6 +156,9 @@ done
 echo ""
 printf "%b\n" "${B}Releasing ${G}${VERSION}${N}${B} tag ${TAG}${N}"
 echo ""
+printf "Platforms: linux (gnu/musl, amd64+arm64), windows, macos, freebsd,\n"
+printf "           OCI image to GHCR.\n"
+echo ""
 
 read -rp "Proceed? [y/N] " confirm
 [[ "$confirm" =~ ^[Yy]$ ]] || die "aborted."
@@ -164,30 +169,21 @@ sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
 cargo update -p sendme --precise "$VERSION" 2>/dev/null || true
 ok "version bumped"
 
-# ── 6. Build binaries ──────────────────────────────────────────────────────
-info "Building release binaries..."
-cargo build --release --target "$TARGET" --bin sendme
-ok "sendme built"
+# ── 6. Build all target platforms ──────────────────────────────────────────
+info "Building all target platforms (hermetic containers)..."
 
-cargo build --release --features balloon --target "$TARGET" --bin sendme-balloon
-ok "sendme-balloon built"
+SDK_NOTE=""
+if [[ ! -d "$ROOT_DIR/sdks/MacOSX.sdk" ]]; then
+    SDK_NOTE=" (macOS targets will be skipped — no Apple SDK)"
+fi
+printf "${C}▶${N} Running scripts/build.sh --dist%s\n" "$SDK_NOTE"
 
-# ── 7. Package tarballs ───────────────────────────────────────────────────
-info "Packaging tarballs..."
-DIST="$ROOT_DIR/dist"
-rm -rf "$DIST"
-mkdir -p "$DIST"
+if ! ./scripts/build.sh --dist; then
+    die "multi-platform build failed — see output above"
+fi
+ok "all available targets built and packaged"
 
-tar czf "$DIST/sendme-v${VERSION}-linux-amd64.tar.gz" \
-    -C "target/$TARGET/release" sendme
-tar czf "$DIST/sendme-balloon-v${VERSION}-linux-amd64.tar.gz" \
-    -C "target/$TARGET/release" sendme-balloon
-
-# Generate checksums for the installer to verify
-(cd "$DIST" && sha256sum sendme-v${VERSION}-linux-amd64.tar.gz sendme-balloon-v${VERSION}-linux-amd64.tar.gz > SHA256SUMS)
-ok "tarballs and checksums packaged"
-
-# ── 8. Container image ────────────────────────────────────────────────────
+# ── 7. Container image ────────────────────────────────────────────────────
 info "Building container image..."
 GIT_SHA=$(git rev-parse --short HEAD)
 
@@ -204,7 +200,7 @@ podman push "${IMAGE}:latest"
 podman push "${IMAGE}:sha-${GIT_SHA}"
 ok "image pushed"
 
-# ── 9. Commit, tag, push, release ─────────────────────────────────────────
+# ── 8. Commit, tag, push, release ─────────────────────────────────────────
 info "Committing, tagging, and creating GitHub release..."
 
 git add Cargo.toml Cargo.lock
@@ -216,12 +212,13 @@ git push origin "$TAG"
 ok "committed and pushed tag ${TAG}"
 
 info "Creating GitHub release..."
+# Upload every archive produced by build.sh plus the checksums.
+shopt -s nullglob
+ASSETS=( "$DIST"/*.tar.gz "$DIST"/*.zip "$DIST"/SHA256SUMS )
 gh release create "$TAG" \
     --title "$TAG" \
     --generate-notes \
-    "$DIST/sendme-v${VERSION}-linux-amd64.tar.gz" \
-    "$DIST/sendme-balloon-v${VERSION}-linux-amd64.tar.gz" \
-    "$DIST/SHA256SUMS"
+    "${ASSETS[@]}"
 ok "GitHub release created"
 
 # ── Done ───────────────────────────────────────────────────────────────────
