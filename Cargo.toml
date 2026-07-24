@@ -41,6 +41,10 @@ crossterm = { version = "0.29.0", features = [
 ], optional = true }
 irpc = "0.17.0"
 
+# dependencies for the sendme-balloon desktop app
+eframe = { version = "0.35", optional = true }
+rfd = { version = "0.17", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.174", optional = true }
 
@@ -55,7 +59,17 @@ tempfile = "3.8.1"
 
 [features]
 clipboard = ["dep:crossterm", "dep:windows-sys", "dep:libc"]
+balloon = ["dep:eframe", "dep:rfd"]
 default = ["clipboard"]
+
+[[bin]]
+name = "sendme"
+path = "src/main.rs"
+
+[[bin]]
+name = "sendme-balloon"
+path = "src/bin/balloon.rs"
+required-features = ["balloon"]
 
 [profile.release]
 panic = "abort"
