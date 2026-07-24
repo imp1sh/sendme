@@ -2,6 +2,8 @@
 //! `sendme-balloon` desktop app.
 
 pub mod balloon;
+#[cfg(feature = "balloon")]
+pub mod contacts;
 
 use std::{
     collections::BTreeMap,

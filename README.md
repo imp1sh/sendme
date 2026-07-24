@@ -2,6 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE-MIT)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE-APACHE)
+[![CI](https://img.shields.io/github/actions/workflow/status/imp1sh/sendme-balloon/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/imp1sh/sendme-balloon/actions/workflows/ci.yml)
+[![container](https://img.shields.io/badge/container-ghcr.io-blue.svg?style=flat-square)](https://github.com/imp1sh/sendme-balloon/pkgs/container/sendme-balloon)
 
 
 **sendme-balloon** is a fork of [`n0-computer/sendme`](https://github.com/n0-computer/sendme). **sendme-balloon** is 
@@ -67,6 +69,31 @@ transfers behave just like the command-line tool.
 - Choose where to save in the folder dialog that appears.
 - A progress bar tracks the download. On success the saved location is shown.
 
+### Address book & direct ticket sharing
+
+The balloon keeps a persistent iroh endpoint with a **stable node id** (a 256-bit
+public key), so other people can reach you by that id alone. The round button in
+the middle of the balloon opens the **address book**, where you manage contacts
+by nickname + node id.
+
+- **Your node id** is shown at the top of the address book with a copy button —
+  share it with whoever wants to add you.
+- **Add a contact** with a name and their node id. The address book is persisted
+  as JSON in your user config directory (`~/.config/sendme-balloon/` on Linux).
+- **Send to a contact**: once a file is prepared and its ticket is shown, press
+  *📤 Send to a contact…* and pick a contact. The balloon pushes the transfer
+  ticket to that contact over iroh (a dedicated `sendme-balloon/offer/1` ALPN),
+  so neither side has to copy/paste the ticket by hand.
+- **Receive from a contact**: when somebody sends you a ticket this way, your
+  balloon prompts *"X wants to send you …"* with **Accept / Decline** buttons.
+  Accepting opens a folder picker and then fetches the data automatically.
+
+Direct contact connectivity relies on iroh's address discovery: the contact
+endpoint publishes its address via n0's pkarr/DNS service, so a bare node id is
+enough to connect (relays/NAT traversal are handled by iroh as usual). Both
+peers must be online at the same time, since iroh is a live point-to-point link
+rather than a store-and-forward mailbox.
+
 ### Notes
 
 - The balloon hides itself while a native file or folder dialog is open and
@@ -114,6 +141,59 @@ directory.
 On completion, it deletes the temp directory.
 
 All temp directories start with `.sendme-`.
+
+# Building & releasing
+
+The [Makefile](Makefile) wraps the common development and release workflow.
+Run `make` or `make help` for the full list of targets.
+
+## Local development
+
+```
+make build              # debug CLI
+make build-balloon      # debug balloon GUI (needs GUI libs on Linux)
+make test               # all tests
+make lint               # fmt + clippy
+```
+
+## Release binaries (amd64)
+
+```
+make release            # optimised CLI binary
+make release-balloon    # optimised balloon GUI binary
+make release-all        # lint + test + both binaries
+make package            # tarball for distribution
+```
+
+## Release management
+
+```
+make bump-version V=0.37.0   # update Cargo.toml version
+git commit -am "bump to 0.37.0"
+make release-tag V=0.37.0    # tag + push (triggers CI)
+```
+
+CI (`.github/workflows/release.yml`) fires on the tag, builds both amd64
+binaries, creates a GitHub Release with downloadable tarballs, and pushes the
+container image to GHCR.
+
+## Container image
+
+The container packages the `sendme` CLI (the balloon GUI needs a display
+server and is distributed as a direct binary download instead).
+
+```
+make docker-build      # build locally
+make docker-push       # push to ghcr.io/imp1sh/sendme-balloon
+make docker-run ARGS="send /data/file.txt"
+```
+
+Pull from the registry:
+
+```
+docker pull ghcr.io/imp1sh/sendme-balloon:latest
+docker run --rm -v "$PWD:/data" ghcr.io/imp1sh/sendme-balloon send /data/myfile
+```
 
 ## License
 

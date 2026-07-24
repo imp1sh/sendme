@@ -2,14 +2,20 @@
 //!
 //! Shows a little balloon hovering on the desktop (frameless, transparent
 //! window, Wayland/XWayland compatible). The upper half of the balloon sends a file,
-//! the lower half receives one.
+//! the lower half receives one. A small round button on the dividing line opens
+//! the address book.
 //!
 //! - Click the upper (blue) half: a file dialog opens, the chosen file is
 //!   imported and a ticket is shown, with a button to copy the
 //!   `sendme receive <ticket>` command to the clipboard. The balloon waits
 //!   until the file was transferred or you press cancel.
+//! - Drag and drop a file onto the balloon to send it directly.
 //! - Click the lower (green) half: paste a ticket, choose where to save,
 //!   and the data is downloaded to that location.
+//! - Click the round button in the middle: open the address book. Add contacts
+//!   by nickname + node id, then send a file's ticket directly to a contact over
+//!   iroh. The contact's balloon prompts them to accept, and on accept the data
+//!   is fetched automatically.
 
 use std::{
     path::PathBuf,
@@ -21,8 +27,14 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Frame, Margin, Pos2, Rect, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
 };
+use iroh::EndpointId;
+use iroh_blobs::ticket::BlobTicket;
 use indicatif::HumanBytes;
 use sendme::balloon::{parse_ticket, receive_ticket, send_file, ReceiveEvent, SendEvent};
+use sendme::contacts::{
+    AddressBook, Contact, IncomingOffer, create_contact_endpoint, load_or_create_secret,
+    run_accept_loop, send_offer,
+};
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 #[cfg(target_os = "linux")]
 use winit::platform::x11::EventLoopBuilderExtX11;
@@ -31,8 +43,17 @@ use winit::platform::x11::EventLoopBuilderExtX11;
 enum Command {
     PickAndSend,
     SendPath(PathBuf),
+    /// Push a transfer ticket to a contact over the contact endpoint.
+    SendOffer {
+        node_id: EndpointId,
+        ticket: String,
+        name: String,
+        size: u64,
+    },
     CancelSend,
     Receive { ticket: String },
+    /// Begin receiving a ticket that arrived via an accepted offer.
+    ReceiveOffer { ticket: String },
     CancelReceive,
 }
 
@@ -43,8 +64,20 @@ enum UiEvent {
     Send(SendEvent),
     TicketInvalid(String),
     FolderPickCancelled,
+    /// The save-folder picker was cancelled during an offer-initiated receive.
+    OfferFolderCancelled,
     ReceiveStarting,
     Receive(ReceiveEvent),
+    /// Our own contact-endpoint node id is known.
+    NodeIdReady(String),
+    /// A remote peer pushed a transfer ticket to us.
+    OfferReceived(IncomingOffer),
+    /// The contact accepted our outgoing offer.
+    OfferAccepted,
+    /// The contact declined our outgoing offer.
+    OfferRejected,
+    /// Something went wrong with an outgoing offer (or the contact endpoint).
+    OfferError(String),
 }
 
 #[derive(Clone)]
@@ -79,6 +112,34 @@ enum UiState {
     ReceiveDone { target: PathBuf },
     /// Something went wrong.
     Error { message: String },
+    /// Browsing/managing the address book.
+    AddressBook,
+    /// Form to add a new contact.
+    AddContact { error: Option<String> },
+    /// Choosing a contact to send the current ticket to.
+    PickContact {
+        ticket: String,
+        name: String,
+        size: u64,
+        peer: bool,
+        sent: u64,
+    },
+    /// An outgoing offer was sent; waiting for the contact's accept/decline.
+    OfferPending {
+        contact_name: String,
+        ticket: String,
+        name: String,
+        size: u64,
+        peer: bool,
+        sent: u64,
+    },
+    /// A remote peer wants to send us a file; awaiting an accept/decline.
+    IncomingOffer {
+        from_short: String,
+        name: String,
+        size: u64,
+        ticket: String,
+    },
 }
 
 const SEND_COLOR: Color32 = Color32::from_rgb(66, 133, 244);
@@ -95,6 +156,15 @@ struct BalloonApp {
     last_size: Vec2,
     cmd_tx: tokio_mpsc::UnboundedSender<Command>,
     evt_rx: std_mpsc::Receiver<UiEvent>,
+    /// Our own contact-endpoint node id, for display/sharing.
+    node_id: String,
+    address_book: AddressBook,
+    /// oneshot used to report the user's accept/decline for the current
+    /// incoming offer. Lives outside [`UiState`] so that state stays `Clone`.
+    pending_offer_respond: Option<oneshot::Sender<bool>>,
+    /// Text inputs for the add-contact form.
+    add_contact_name: String,
+    add_contact_node_id: String,
 }
 
 impl BalloonApp {
@@ -109,6 +179,11 @@ impl BalloonApp {
             last_size: Vec2::ZERO,
             cmd_tx,
             evt_rx,
+            node_id: String::new(),
+            address_book: AddressBook::load().unwrap_or_default(),
+            pending_offer_respond: None,
+            add_contact_name: String::new(),
+            add_contact_node_id: String::new(),
         }
     }
 
@@ -152,7 +227,69 @@ impl BalloonApp {
                     let name = name.clone();
                     self.state = UiState::SendDone { name };
                 }
-                (SendEvent::Error(message), UiState::Preparing { .. } | UiState::Waiting { .. }) => {
+                (
+                    SendEvent::Error(message),
+                    UiState::Preparing { .. } | UiState::Waiting { .. },
+                ) => {
+                    self.state = UiState::Error { message };
+                }
+                // keep counters warm while the user is still picking a contact
+                (SendEvent::PeerConnected, UiState::PickContact { peer, .. }) => {
+                    *peer = true;
+                }
+                (SendEvent::Progress { sent }, UiState::PickContact { sent: s, peer, .. }) => {
+                    *peer = true;
+                    *s = sent;
+                }
+                (SendEvent::Completed, UiState::PickContact { name, .. }) => {
+                    let name = name.clone();
+                    self.state = UiState::SendDone { name };
+                }
+                (SendEvent::Error(message), UiState::PickContact { .. }) => {
+                    self.state = UiState::Error { message };
+                }
+                // while waiting for the contact's decision, a peer connecting
+                // means the transfer has started -> show normal progress
+                (
+                    SendEvent::PeerConnected,
+                    UiState::OfferPending {
+                        ticket, name, size, sent, ..
+                    },
+                ) => {
+                    let ticket = ticket.clone();
+                    let name = name.clone();
+                    let size = *size;
+                    let sent = *sent;
+                    self.state = UiState::Waiting {
+                        ticket,
+                        name,
+                        size,
+                        peer: true,
+                        sent,
+                    };
+                }
+                (
+                    SendEvent::Progress { sent },
+                    UiState::OfferPending {
+                        ticket, name, size, ..
+                    },
+                ) => {
+                    let ticket = ticket.clone();
+                    let name = name.clone();
+                    let size = *size;
+                    self.state = UiState::Waiting {
+                        ticket,
+                        name,
+                        size,
+                        peer: true,
+                        sent,
+                    };
+                }
+                (SendEvent::Completed, UiState::OfferPending { name, .. }) => {
+                    let name = name.clone();
+                    self.state = UiState::SendDone { name };
+                }
+                (SendEvent::Error(message), UiState::OfferPending { .. }) => {
                     self.state = UiState::Error { message };
                 }
                 _ => {}
@@ -165,6 +302,11 @@ impl BalloonApp {
             UiEvent::FolderPickCancelled => {
                 if matches!(self.state, UiState::PickingFolder) {
                     self.state = UiState::EnterTicket { error: None };
+                }
+            }
+            UiEvent::OfferFolderCancelled => {
+                if matches!(self.state, UiState::PickingFolder) {
+                    self.state = UiState::Idle;
                 }
             }
             UiEvent::ReceiveStarting => {
@@ -218,12 +360,75 @@ impl BalloonApp {
                 }
                 _ => {}
             },
+            UiEvent::NodeIdReady(id) => {
+                self.node_id = id;
+            }
+            UiEvent::OfferReceived(offer) => {
+                if matches!(self.state, UiState::Idle) {
+                    self.pending_offer_respond = Some(offer.respond);
+                    self.state = UiState::IncomingOffer {
+                        from_short: offer.from_short,
+                        name: offer.name,
+                        size: offer.size,
+                        ticket: offer.ticket,
+                    };
+                } else {
+                    // busy: decline so the sender does not hang
+                    let _ = offer.respond.send(false);
+                }
+            }
+            UiEvent::OfferAccepted => {
+                let next = if let UiState::OfferPending {
+                    ticket,
+                    name,
+                    size,
+                    peer,
+                    sent,
+                    ..
+                } = &self.state
+                {
+                    Some(UiState::Waiting {
+                        ticket: ticket.clone(),
+                        name: name.clone(),
+                        size: *size,
+                        peer: *peer,
+                        sent: *sent,
+                    })
+                } else {
+                    None
+                };
+                if let Some(s) = next {
+                    self.state = s;
+                }
+            }
+            UiEvent::OfferRejected => {
+                if matches!(self.state, UiState::OfferPending { .. }) {
+                    self.send_cmd(Command::CancelSend);
+                    self.state = UiState::Error {
+                        message: "contact declined the transfer".into(),
+                    };
+                }
+            }
+            UiEvent::OfferError(message) => {
+                if matches!(self.state, UiState::OfferPending { .. }) {
+                    self.send_cmd(Command::CancelSend);
+                    self.state = UiState::Error { message };
+                }
+            }
         }
     }
 
     fn close_operation(&mut self) {
+        // declining a pending incoming offer: dropping the oneshot sender
+        // makes the accept loop treat it as a rejection.
+        if matches!(self.state, UiState::IncomingOffer { .. }) {
+            self.pending_offer_respond.take();
+        }
         match &self.state {
-            UiState::PickingFile | UiState::Preparing { .. } | UiState::Waiting { .. } => {
+            UiState::PickingFile
+            | UiState::Preparing { .. }
+            | UiState::Waiting { .. }
+            | UiState::OfferPending { .. } => {
                 self.send_cmd(Command::CancelSend);
             }
             UiState::PickingFolder | UiState::Receiving { .. } => {
@@ -237,6 +442,9 @@ impl BalloonApp {
     fn desired_size(&self) -> Vec2 {
         match self.state {
             UiState::Idle => IDLE_SIZE,
+            UiState::AddressBook | UiState::AddContact { .. } | UiState::PickContact { .. } => {
+                Vec2::new(370.0, 320.0)
+            }
             _ => Vec2::new(370.0, 250.0),
         }
     }
@@ -392,6 +600,29 @@ impl BalloonApp {
             return;
         }
 
+        // small round button on the dividing line -> address book
+        let btn_rect = Rect::from_center_size(center, Vec2::splat(26.0));
+        let btn_resp = ui.interact(btn_rect, ui.id().with("addr"), Sense::click());
+        let btn_hover = btn_resp.hovered();
+        let btn_col = if btn_hover {
+            Color32::from_gray(70)
+        } else {
+            Color32::from_gray(50)
+        };
+        painter.circle_filled(center, 12.0, btn_col);
+        painter.circle_stroke(center, 12.0, Stroke::new(1.5, Color32::WHITE));
+        painter.text(
+            center,
+            Align2::CENTER_CENTER,
+            "📇",
+            FontId::proportional(13.0),
+            Color32::WHITE,
+        );
+        if btn_resp.clicked() {
+            self.state = UiState::AddressBook;
+            return;
+        }
+
         // interactions: drag moves the window, click triggers an action
         if resp.drag_started() {
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
@@ -510,6 +741,16 @@ impl BalloonApp {
                         HumanBytes(size)
                     )));
                 }
+                ui.add_space(6.0);
+                if ui.button("📤 Send to a contact…").clicked() {
+                    self.state = UiState::PickContact {
+                        ticket,
+                        name,
+                        size,
+                        peer,
+                        sent,
+                    };
+                }
             }
             UiState::SendDone { name } => {
                 self.title_bar(ui, ctx, "🎈 Send");
@@ -604,6 +845,216 @@ impl BalloonApp {
                     self.state = UiState::Idle;
                 }
             }
+            UiState::AddressBook => {
+                self.title_bar(ui, ctx, "📇 Contacts");
+                ui.label("Your node id (share with contacts):");
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical().max_height(54.0).show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&self.node_id).monospace().size(10.0))
+                            .wrap(),
+                    );
+                });
+                ui.add_space(2.0);
+                if ui.button("📋 Copy my node id").clicked() {
+                    ctx.copy_text(self.node_id.clone());
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                if self.address_book.contacts.is_empty() {
+                    ui.label("(no contacts yet)");
+                } else {
+                    egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
+                        let mut to_remove: Option<String> = None;
+                        for c in &self.address_book.contacts {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&c.name).strong());
+                                ui.label(
+                                    RichText::new(short_id(&c.node_id))
+                                        .weak()
+                                        .size(10.0),
+                                );
+                                if ui
+                                    .small_button("🗑")
+                                    .on_hover_text("remove contact")
+                                    .clicked()
+                                {
+                                    to_remove = Some(c.node_id.clone());
+                                }
+                            });
+                        }
+                        if let Some(id) = to_remove {
+                            self.address_book.remove(&id);
+                            let _ = self.address_book.save();
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("➕ Add contact").clicked() {
+                        self.add_contact_name.clear();
+                        self.add_contact_node_id.clear();
+                        self.state = UiState::AddContact { error: None };
+                    }
+                    if ui.button("Back").clicked() {
+                        self.state = UiState::Idle;
+                    }
+                });
+            }
+            UiState::AddContact { error } => {
+                self.title_bar(ui, ctx, "➕ Add contact");
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut self.add_contact_name);
+                ui.add_space(4.0);
+                ui.label("Node id:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.add_contact_node_id)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("paste the 256-bit node id"),
+                );
+                if let Some(err) = &error {
+                    ui.colored_label(Color32::from_rgb(230, 90, 90), err);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let save = ui.add_enabled(
+                        !self.add_contact_name.trim().is_empty()
+                            && !self.add_contact_node_id.trim().is_empty(),
+                        egui::Button::new("Save"),
+                    );
+                    if save.clicked() {
+                        match self.add_contact_node_id.trim().parse::<EndpointId>() {
+                            Ok(_) => {
+                                let contact = Contact {
+                                    name: self.add_contact_name.trim().to_string(),
+                                    node_id: self.add_contact_node_id.trim().to_string(),
+                                };
+                                self.address_book.contacts.push(contact);
+                                let _ = self.address_book.save();
+                                self.state = UiState::AddressBook;
+                            }
+                            Err(e) => {
+                                self.state = UiState::AddContact {
+                                    error: Some(format!("invalid node id: {e}")),
+                                };
+                            }
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.state = UiState::AddressBook;
+                    }
+                });
+            }
+            UiState::PickContact {
+                ticket,
+                name,
+                size,
+                peer,
+                sent,
+            } => {
+                self.title_bar(ui, ctx, "📤 Send to");
+                ui.label(format!("Choose a contact for \"{name}\" ({}):", HumanBytes(size)));
+                ui.add_space(6.0);
+                let mut chosen: Option<(EndpointId, String)> = None;
+                if self.address_book.contacts.is_empty() {
+                    ui.label("(no contacts yet — add some in the address book)");
+                } else {
+                    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                        for c in &self.address_book.contacts {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&c.name).strong());
+                                ui.label(
+                                    RichText::new(short_id(&c.node_id)).weak().size(10.0),
+                                );
+                                if ui.button("Send").clicked() {
+                                    if let Ok(id) = c.endpoint_id() {
+                                        chosen = Some((id, c.name.clone()));
+                                    }
+                                }
+                            });
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+                if let Some((node_id, contact_name)) = chosen {
+                    self.send_cmd(Command::SendOffer {
+                        node_id,
+                        ticket: ticket.clone(),
+                        name: name.clone(),
+                        size,
+                    });
+                    self.state = UiState::OfferPending {
+                        contact_name,
+                        ticket,
+                        name,
+                        size,
+                        peer,
+                        sent,
+                    };
+                    return;
+                }
+                if ui.button("Back").clicked() {
+                    self.state = UiState::Waiting {
+                        ticket,
+                        name,
+                        size,
+                        peer,
+                        sent,
+                    };
+                }
+            }
+            UiState::OfferPending {
+                contact_name,
+                name,
+                size,
+                ..
+            } => {
+                self.title_bar(ui, ctx, "📤 Send");
+                ui.label(format!(
+                    "Asking {contact_name} to accept \"{name}\" ({})…",
+                    HumanBytes(size)
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("waiting for a reply…");
+                });
+                ui.add_space(8.0);
+                if ui.button("Cancel").clicked() {
+                    self.close_operation();
+                }
+            }
+            UiState::IncomingOffer {
+                from_short,
+                name,
+                size,
+                ticket,
+            } => {
+                self.title_bar(ui, ctx, "📥 Incoming transfer");
+                ui.label(format!("{from_short} wants to send you:"));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("\"{name}\"  ({})", HumanBytes(size))).strong(),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("✔ Accept").clicked() {
+                        if let Some(r) = self.pending_offer_respond.take() {
+                            let _ = r.send(true);
+                        }
+                        self.state = UiState::PickingFolder;
+                        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                        self.send_cmd(Command::ReceiveOffer { ticket });
+                    }
+                    if ui.button("✘ Decline").clicked() {
+                        if let Some(r) = self.pending_offer_respond.take() {
+                            let _ = r.send(false);
+                        }
+                        self.state = UiState::Idle;
+                    }
+                });
+            }
         }
     }
 }
@@ -654,6 +1105,17 @@ fn first_dropped_path(files: &[egui::DroppedFile]) -> Option<PathBuf> {
     files.iter().find_map(|file| file.path.clone())
 }
 
+/// Compact, panic-safe preview of a node id.
+fn short_id(id: &str) -> String {
+    let count = id.chars().count();
+    let prefix: String = id.chars().take(10).collect();
+    if count > 10 {
+        format!("{prefix}…")
+    } else {
+        id.to_string()
+    }
+}
+
 fn start_send(
     path: PathBuf,
     cancel_send: &mut Option<oneshot::Sender<()>>,
@@ -682,8 +1144,31 @@ fn start_send(
     });
 }
 
+/// Kick off a receive after a save folder has been chosen.
+fn start_receive(
+    ticket: BlobTicket,
+    dir: PathBuf,
+    recv_task: &mut Option<tokio::task::JoinHandle<()>>,
+    evt_tx: &std_mpsc::Sender<UiEvent>,
+    ctx: &egui::Context,
+) {
+    let _ = evt_tx.send(UiEvent::ReceiveStarting);
+    ctx.request_repaint();
+    let (re_tx, mut re_rx) = tokio_mpsc::channel(64);
+    *recv_task = Some(tokio::spawn(receive_ticket(ticket, dir, re_tx)));
+    let evt_tx = evt_tx.clone();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        while let Some(e) = re_rx.recv().await {
+            let _ = evt_tx.send(UiEvent::Receive(e));
+            ctx.request_repaint();
+        }
+    });
+}
+
 /// The background worker owns the tokio runtime and drives the actual
-/// sendme send/receive operations.
+/// sendme send/receive operations, plus the persistent contact endpoint used
+/// to exchange transfer-ticket offers between two balloons.
 fn spawn_worker(
     ctx: egui::Context,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>,
@@ -699,6 +1184,37 @@ fn spawn_worker(
                 evt_tx.send(e).ok();
                 ctx.request_repaint();
             };
+
+            // persistent contact endpoint for ticket offers
+            let contact_ep = match async {
+                let secret = load_or_create_secret()?;
+                let ep = create_contact_endpoint(secret).await?;
+                anyhow::Ok(ep)
+            }
+            .await
+            {
+                Ok(ep) => {
+                    emit(UiEvent::NodeIdReady(ep.id().to_string()));
+                    let (offer_tx, mut offer_rx) = tokio_mpsc::channel::<IncomingOffer>(16);
+                    tokio::spawn(run_accept_loop(ep.clone(), offer_tx));
+                    let evt_tx2 = evt_tx.clone();
+                    let ctx2 = ctx.clone();
+                    tokio::spawn(async move {
+                        while let Some(offer) = offer_rx.recv().await {
+                            let _ = evt_tx2.send(UiEvent::OfferReceived(offer));
+                            ctx2.request_repaint();
+                        }
+                    });
+                    Some(ep)
+                }
+                Err(e) => {
+                    emit(UiEvent::OfferError(format!(
+                        "contact endpoint unavailable: {e:#}"
+                    )));
+                    None
+                }
+            };
+
             let mut cancel_send: Option<oneshot::Sender<()>> = None;
             let mut recv_task: Option<tokio::task::JoinHandle<()>> = None;
             while let Some(cmd) = cmd_rx.recv().await {
@@ -722,6 +1238,31 @@ fn spawn_worker(
                     Command::SendPath(path) => {
                         start_send(path, &mut cancel_send, &evt_tx, &ctx);
                     }
+                    Command::SendOffer {
+                        node_id,
+                        ticket,
+                        name,
+                        size,
+                    } => match &contact_ep {
+                        Some(ep) => {
+                            let ep = ep.clone();
+                            let evt_tx2 = evt_tx.clone();
+                            let ctx2 = ctx.clone();
+                            tokio::spawn(async move {
+                                let evt =
+                                    match send_offer(&ep, node_id, ticket, name, size).await {
+                                        Ok(true) => UiEvent::OfferAccepted,
+                                        Ok(false) => UiEvent::OfferRejected,
+                                        Err(e) => UiEvent::OfferError(format!("{e:#}")),
+                                    };
+                                let _ = evt_tx2.send(evt);
+                                ctx2.request_repaint();
+                            });
+                        }
+                        None => emit(UiEvent::OfferError(
+                            "contact endpoint unavailable".into(),
+                        )),
+                    },
                     Command::CancelSend => {
                         if let Some(c) = cancel_send.take() {
                             c.send(()).ok();
@@ -740,23 +1281,36 @@ fn spawn_worker(
                             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                             match dir {
                                 None => emit(UiEvent::FolderPickCancelled),
-                                Some(dir) => {
-                                    emit(UiEvent::ReceiveStarting);
-                                    let (re_tx, mut re_rx) = tokio_mpsc::channel(64);
-                                    recv_task = Some(tokio::spawn(receive_ticket(
-                                        ticket,
-                                        dir.path().to_path_buf(),
-                                        re_tx,
-                                    )));
-                                    let evt_tx = evt_tx.clone();
-                                    let ctx = ctx.clone();
-                                    tokio::spawn(async move {
-                                        while let Some(e) = re_rx.recv().await {
-                                            evt_tx.send(UiEvent::Receive(e)).ok();
-                                            ctx.request_repaint();
-                                        }
-                                    });
-                                }
+                                Some(dir) => start_receive(
+                                    ticket,
+                                    dir.path().to_path_buf(),
+                                    &mut recv_task,
+                                    &evt_tx,
+                                    &ctx,
+                                ),
+                            }
+                        }
+                    },
+                    Command::ReceiveOffer { ticket } => match parse_ticket(&ticket) {
+                        Err(e) => {
+                            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                            emit(UiEvent::TicketInvalid(e.to_string()));
+                        }
+                        Ok(ticket) => {
+                            let dir = rfd::AsyncFileDialog::new()
+                                .set_title("sendme: choose where to save")
+                                .pick_folder()
+                                .await;
+                            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                            match dir {
+                                None => emit(UiEvent::OfferFolderCancelled),
+                                Some(dir) => start_receive(
+                                    ticket,
+                                    dir.path().to_path_buf(),
+                                    &mut recv_task,
+                                    &evt_tx,
+                                    &ctx,
+                                ),
                             }
                         }
                     },
@@ -821,6 +1375,11 @@ mod tests {
                 last_size: Vec2::ZERO,
                 cmd_tx,
                 evt_rx,
+                node_id: String::new(),
+                address_book: AddressBook::default(),
+                pending_offer_respond: None,
+                add_contact_name: String::new(),
+                add_contact_node_id: String::new(),
             },
             cmd_rx,
         )
@@ -865,5 +1424,63 @@ mod tests {
         app.apply(UiEvent::FilePickCancelled);
 
         assert!(matches!(app.state, UiState::Idle));
+    }
+
+    #[test]
+    fn short_id_truncates_long_ids() {
+        let id = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop";
+        let s = short_id(id);
+        assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), 11);
+    }
+
+    #[test]
+    fn short_id_preserves_short_ids() {
+        let id = "abc";
+        assert_eq!(short_id(id), "abc");
+    }
+
+    #[test]
+    fn incoming_offer_while_busy_is_declined() {
+        let (mut app, _cmds) = app_in_state(UiState::Waiting {
+            ticket: "t".into(),
+            name: "n".into(),
+            size: 1,
+            peer: false,
+            sent: 0,
+        });
+        let (tx, rx) = oneshot::channel();
+        let offer = IncomingOffer {
+            from: "f".into(),
+            from_short: "f".into(),
+            name: "n".into(),
+            size: 1,
+            ticket: "t".into(),
+            respond: tx,
+        };
+        app.apply(UiEvent::OfferReceived(offer));
+        // busy -> declined, state unchanged
+        assert!(matches!(app.state, UiState::Waiting { .. }));
+        assert_eq!(rx.blocking_recv(), Ok(false));
+    }
+
+    #[test]
+    fn incoming_offer_when_idle_prompts_user() {
+        let (mut app, _cmds) = app_in_state(UiState::Idle);
+        let (tx, rx) = oneshot::channel();
+        let offer = IncomingOffer {
+            from: "f".into(),
+            from_short: "f".into(),
+            name: "pic.png".into(),
+            size: 42,
+            ticket: "tk".into(),
+            respond: tx,
+        };
+        app.apply(UiEvent::OfferReceived(offer));
+        assert!(matches!(app.state, UiState::IncomingOffer { .. }));
+        // simulate the user declining via close_operation
+        app.close_operation();
+        assert!(matches!(app.state, UiState::Idle));
+        assert!(rx.blocking_recv().is_err());
     }
 }
