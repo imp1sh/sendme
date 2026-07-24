@@ -115,6 +115,7 @@ ifndef V
 	$(error Usage: make bump-version V=<version>, e.g. make bump-version V=0.37.0)
 endif
 	sed -i 's/^version = .*/version = "$(V)"/' Cargo.toml
+	cargo update -p sendme --precise $(V)
 	@printf "$(GREEN)Bumped to $(V)$RESET — review, commit, then: make release-tag V=$(V)\n"
 
 .PHONY: release-tag
