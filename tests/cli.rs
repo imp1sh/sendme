@@ -55,7 +55,11 @@ fn send_recv_file() {
     std::fs::write(&src_file, &data).unwrap();
     let mut send_cmd = duct::cmd(
         sendme_bin(),
-        ["send", "--no-progress", src_file.as_os_str().to_str().unwrap()],
+        [
+            "send",
+            "--no-progress",
+            src_file.as_os_str().to_str().unwrap(),
+        ],
     )
     .dir(src_dir.path())
     .env_remove("RUST_LOG") // disable tracing
@@ -91,7 +95,11 @@ fn receive_closes_endpoint_no_iroh_socket_error() {
     std::fs::write(&src_file, &data).unwrap();
     let mut send_cmd = duct::cmd(
         sendme_bin(),
-        ["send", "--no-progress", src_file.as_os_str().to_str().unwrap()],
+        [
+            "send",
+            "--no-progress",
+            src_file.as_os_str().to_str().unwrap(),
+        ],
     )
     .dir(src_dir.path())
     .env_remove("RUST_LOG")
@@ -155,7 +163,11 @@ fn send_recv_dir() {
     }
     let mut send_cmd = duct::cmd(
         sendme_bin(),
-        ["send", "--no-progress", src_data_dir.as_os_str().to_str().unwrap()],
+        [
+            "send",
+            "--no-progress",
+            src_data_dir.as_os_str().to_str().unwrap(),
+        ],
     )
     .dir(src_dir.path())
     .env_remove("RUST_LOG") // disable tracing
@@ -173,8 +185,8 @@ fn send_recv_dir() {
     .dir(tgt_dir.path())
     .env_remove("RUST_LOG") // disable tracing
     .stderr_to_stdout()
-        .run()
-        .unwrap();
+    .run()
+    .unwrap();
     assert!(receive_output.status.success());
     // validate directory structure
     for i in 0..5 {
