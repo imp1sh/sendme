@@ -1,50 +1,35 @@
 #!/usr/bin/env bash
 #
-# sendme-balloon — release script
-#
-# Automates the full release lifecycle from a clean main branch:
-#   1.  validate prerequisites and repository state
-#   2.  bump version in Cargo.toml + Cargo.lock
-#   3.  lint and test
-#   4.  build release binaries (CLI + balloon GUI)
-#   5.  package tarballs
-#   6.  build and push container image to GHCR
-#   7.  commit, tag, and push
-#   8.  create a GitHub Release with downloadable tarballs
+# sendme-balloon — interactive release script
 #
 # Usage:
-#   ./scripts/release.sh 0.1.0
+#   make release
+#   ./scripts/release.sh
 #
-# Prerequisites:
-#   - Rust toolchain (rustup)
-#   - Docker (logged in to ghcr.io)
-#   - GitHub CLI (gh), authenticated
+# The script shows the current version, suggests the next patch version,
+# and asks you what the next version should be.  Then it does everything:
+#   - bumps version, lints, tests
+#   - builds optimised binaries (CLI + balloon GUI)
+#   - packages tarballs
+#   - builds and pushes container image to GHCR
+#   - commits, tags, pushes, and creates a GitHub Release with downloads
 #
-# Authenticate once before first use:
+# Prerequisites (one-time):
 #   gh auth login
-#   echo "$GHCR_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+#   podman login ghcr.io -u <github-username>
 #
 
 set -euo pipefail
 
 # ── Colours ─────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
-    BOLD='\033[1m'; GREEN='\033[32m'; RED='\033[31m'; YELLOW='\033[33m'; CYAN='\033[36m'; RESET='\033[0m'
+    B='\033[1m'; G='\033[32m'; R='\033[31m'; Y='\033[33m'; C='\033[36m'; N='\033[0m'
 else
-    BOLD=''; GREEN=''; RED=''; YELLOW=''; CYAN=''; RESET=''
+    B=''; G=''; R=''; Y=''; C=''; N=''
 fi
-
-info()  { printf "${CYAN}▶${RESET} %s\n" "$*"; }
-ok()    { printf "${GREEN}✓${RESET} %s\n" "$*"; }
-warn()  { printf "${YELLOW}⚠${RESET} %s\n" "$*"; }
-fail()  { printf "${RED}✗${RESET} %s\n" "$*" >&2; exit 1; }
-
-# ── Arguments ───────────────────────────────────────────────────────────────
-VERSION="${1:-}"
-[[ -z "$VERSION" ]] && fail "Usage: $0 <version>   e.g. $0 0.1.0"
-
-# Strip a leading 'v' if the user typed one.
-VERSION="${VERSION#v}"
+info()  { printf "${C}▶${N} %s\n" "$*"; }
+ok()    { printf "${G}✓${N} %s\n" "$*"; }
+die()   { printf "${R}✗${N} %s\n" "$*" >&2; exit 1; }
 
 REPO_OWNER="imp1sh"
 REPO_NAME="sendme-balloon"
@@ -52,131 +37,155 @@ IMAGE="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
 TARGET="x86_64-unknown-linux-gnu"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 cd "$ROOT_DIR"
 
-# ── Step 1: Prerequisites ──────────────────────────────────────────────────
-info "Step 1/8: checking prerequisites"
+# ── Helpers ─────────────────────────────────────────────────────────────────
+bump_patch() {
+    local v="$1"
+    IFS='.' read -r major minor patch <<< "$v"
+    echo "${major}.${minor}.$((patch + 1))"
+}
 
-command -v cargo >/dev/null 2>&1 || fail "cargo not found — install Rust: https://rustup.rs"
-command -v docker >/dev/null 2>&1 || fail "docker not found — install Docker: https://docs.docker.com/get-docker/"
-command -v gh >/dev/null 2>&1 || fail "gh CLI not found — install: https://cli.github.com/"
+# ── Current version ─────────────────────────────────────────────────────────
+CURRENT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+SUGGESTED=$(bump_patch "$CURRENT_VERSION")
 
-gh auth status >/dev/null 2>&1 || fail "gh not authenticated — run: gh auth login"
+echo ""
+printf "${B}sendme-balloon release${N}\n"
+printf "  Current version: ${G}%s${N}\n" "$CURRENT_VERSION"
+printf "  Suggested next:   %s\n" "$SUGGESTED"
+echo ""
 
-ok "all prerequisites satisfied"
+# ── Ask for the next version ───────────────────────────────────────────────
+while true; do
+    read -rp "Release version [${SUGGESTED}]: " VERSION
+    VERSION="${VERSION:-$SUGGESTED}"
+    VERSION="${VERSION#v}"  # strip leading 'v'
 
-# ── Step 2: Repository state ────────────────────────────────────────────────
-info "Step 2/8: validating repository state"
+    if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf "${R}Must be x.y.z (e.g. 0.1.0)${N}\n"
+        continue
+    fi
+
+    TAG="v${VERSION}"
+    if git rev-parse "$TAG" >/dev/null 2>&1; then
+        printf "${R}Tag %s already exists.${N}\n" "$TAG"
+        continue
+    fi
+    break
+done
+
+echo ""
+printf "${B}Releasing ${G}%s${N}${B} (tag %s)${N}\n" "$VERSION" "$TAG"
+echo ""
+
+# ── Confirm ────────────────────────────────────────────────────────────────
+read -rp "Proceed? [y/N] " confirm
+[[ "$confirm" =~ ^[Yy]$ ]] || die "aborted."
+
+# ── 1. Prerequisites ───────────────────────────────────────────────────────
+info "Checking prerequisites..."
+
+command -v cargo  >/dev/null 2>&1 || die "cargo not found — install Rust: https://rustup.rs"
+command -v podman >/dev/null 2>&1 || die "podman not found — install: https://podman.io"
+command -v gh     >/dev/null 2>&1 || die "gh CLI not found — install: https://cli.github.com/"
+
+gh auth status >/dev/null 2>&1 || die "gh not authenticated — run: gh auth login"
+ok "prerequisites satisfied"
+
+# ── 2. Repository state ────────────────────────────────────────────────────
+info "Validating repository state..."
 
 BRANCH="$(git branch --show-current)"
-[[ "$BRANCH" == "main" ]] || fail "not on main (currently on '$BRANCH') — merge your feature branch first"
+[[ "$BRANCH" == "main" ]] || die "not on main (on '${BRANCH}') — merge your feature branch first"
 
-[[ -z "$(git status --porcelain)" ]] || fail "working tree is dirty — commit or stash first"
+[[ -z "$(git status --porcelain)" ]] || die "working tree is dirty — commit or stash first"
 
 git fetch origin --quiet
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse origin/main)
-[[ "$LOCAL" == "$REMOTE" ]] || fail "local main is not in sync with origin — push or pull first"
+[[ "$LOCAL" == "$REMOTE" ]] || die "local main is not in sync with origin — push or pull first"
 
-TAG="v${VERSION}"
-if git rev-parse "$TAG" >/dev/null 2>&1; then
-    fail "tag $TAG already exists"
-fi
+ok "on main, clean tree, in sync with origin"
 
-ok "on main, clean tree, in sync with origin, tag $TAG is free"
+# ── 3. Version bump ────────────────────────────────────────────────────────
+info "Bumping version to ${VERSION}..."
+sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
+cargo update -p sendme --precise "$VERSION" 2>/dev/null || true
+ok "version bumped"
 
-# ── Step 3: Version bump ───────────────────────────────────────────────────
-info "Step 3/8: bumping version to ${VERSION}"
-
-CURRENT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-
-if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
-    warn "Cargo.toml already at ${VERSION} — skipping bump"
-else
-    sed -i "s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
-    cargo update -p sendme --precise "$VERSION" 2>/dev/null || true
-    ok "bumped Cargo.toml and Cargo.lock to ${VERSION}"
-fi
-
-# ── Step 4: Lint and test ──────────────────────────────────────────────────
-info "Step 4/8: running lint and tests"
-
+# ── 4. Lint and test ────────────────────────────────────────────────────────
+info "Linting..."
 cargo fmt --all -- --check
 ok "fmt clean"
 
 cargo clippy --all-features --all-targets -- -D warnings
 ok "clippy clean"
 
+info "Testing..."
 cargo test --all-features --bins --tests
 ok "tests pass"
 
-# ── Step 5: Build release binaries ──────────────────────────────────────────
-info "Step 5/8: building release binaries"
-
+# ── 5. Build binaries ──────────────────────────────────────────────────────
+info "Building release binaries..."
 cargo build --release --target "$TARGET" --bin sendme
-ok "CLI binary built"
+ok "sendme built"
 
 cargo build --release --features balloon --target "$TARGET" --bin sendme-balloon
-ok "balloon binary built"
+ok "sendme-balloon built"
 
-# ── Step 6: Package tarballs ───────────────────────────────────────────────
-info "Step 6/8: packaging tarballs"
-
+# ── 6. Package tarballs ───────────────────────────────────────────────────
+info "Packaging tarballs..."
 DIST="$ROOT_DIR/dist"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
 tar czf "$DIST/sendme-v${VERSION}-linux-amd64.tar.gz" \
     -C "target/$TARGET/release" sendme
-ok "packaged sendme-v${VERSION}-linux-amd64.tar.gz"
-
 tar czf "$DIST/sendme-balloon-v${VERSION}-linux-amd64.tar.gz" \
     -C "target/$TARGET/release" sendme-balloon
-ok "packaged sendme-balloon-v${VERSION}-linux-amd64.tar.gz"
+ok "tarballs packaged"
 
-# ── Step 7: Container image ────────────────────────────────────────────────
-info "Step 7/8: building and pushing container image"
-
+# ── 7. Container image ─────────────────────────────────────────────────────
+info "Building container image..."
 GIT_SHA=$(git rev-parse --short HEAD)
 
-docker build \
+podman build \
     --tag "${IMAGE}:${VERSION}" \
     --tag "${IMAGE}:latest" \
     --tag "${IMAGE}:sha-${GIT_SHA}" \
     .
+ok "image built"
 
-ok "container image built"
+info "Pushing container image..."
+podman push "${IMAGE}:${VERSION}"
+podman push "${IMAGE}:latest"
+podman push "${IMAGE}:sha-${GIT_SHA}"
+ok "image pushed"
 
-docker push "${IMAGE}:${VERSION}"
-docker push "${IMAGE}:latest"
-docker push "${IMAGE}:sha-${GIT_SHA}"
-ok "pushed ${IMAGE}:${VERSION}, :latest, :sha-${GIT_SHA}"
-
-# ── Step 8: Commit, tag, push, release ──────────────────────────────────────
-info "Step 8/8: committing, tagging, and creating GitHub release"
+# ── 8. Commit, tag, push, release ─────────────────────────────────────────
+info "Committing, tagging, and creating GitHub release..."
 
 git add Cargo.toml Cargo.lock
-git commit -m "release v${VERSION}" --allow-empty || warn "nothing to commit (version already set)"
-ok "committed"
+git commit -m "release v${VERSION}" --allow-empty 2>/dev/null || true
 
 git tag -a "$TAG" -m "Release $TAG"
 git push origin main
 git push origin "$TAG"
-ok "pushed commit and tag $TAG"
+ok "committed and pushed tag ${TAG}"
 
+info "Creating GitHub release..."
 gh release create "$TAG" \
     --title "$TAG" \
     --generate-notes \
     "$DIST/sendme-v${VERSION}-linux-amd64.tar.gz" \
     "$DIST/sendme-balloon-v${VERSION}-linux-amd64.tar.gz"
+ok "GitHub release created"
 
-ok "GitHub release created: https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/${TAG}"
-
-# ── Summary ────────────────────────────────────────────────────────────────
+# ── Done ───────────────────────────────────────────────────────────────────
 echo ""
-printf "${BOLD}${GREEN}═══ Release ${VERSION} complete ═══${RESET}\n"
-printf "  Binaries:  https://github.com/%s/%s/releases/tag/%s\n" "$REPO_OWNER" "$REPO_NAME" "$TAG"
-printf "  Container: %s:%s\n" "$IMAGE" "$VERSION"
-printf "  Container: %s:latest\n" "$IMAGE"
+printf "${B}${G}═══ Release ${VERSION} complete ═══${N}\n"
+printf "  Downloads:  https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/${TAG}\n"
+printf "  Container:  %s:%s\n" "$IMAGE" "$VERSION"
+printf "  Container:  %s:latest\n" "$IMAGE"
 echo ""

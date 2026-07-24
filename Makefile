@@ -84,11 +84,8 @@ check: ## Test — type-check all features
 # ── Release ────────────────────────────────────────────────────────────────
 
 .PHONY: release
-release: ## Release — full automated release (usage: make release V=0.1.0)
-ifndef V
-	$(error Usage: make release V=<version>   e.g. make release V=0.1.0)
-endif
-	./scripts/release.sh "$(V)"
+release: ## Release — interactive: shows current version, asks for next, does everything
+	./scripts/release.sh
 
 .PHONY: build-release
 build-release: ## Release — optimised CLI binary only (no release process)

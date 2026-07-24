@@ -151,18 +151,15 @@ You need the following tools installed and configured before you can release:
 | Tool | Purpose | Setup |
 |------|---------|-------|
 | **Rust** | compile binaries | [rustup.rs](https://rustup.rs) |
-| **Docker** | build & push container image | [docs.docker.com](https://docs.docker.com/get-docker/) |
+| **Podman** | build & push container image | [podman.io](https://podman.io) |
 | **gh CLI** | create GitHub releases with downloads | [cli.github.com](https://cli.github.com/) |
 
-One-time authentication (do this once, credentials are cached):
+One-time authentication (credentials are cached):
 
 ```bash
-gh auth login                                                          # for GitHub releases
-echo "$GHCR_TOKEN" | docker login ghcr.io -u USERNAME --password-stdin  # for container registry
+gh auth login                                  # for GitHub releases
+podman login ghcr.io -u <github-username>      # for container registry
 ```
-
-The `GHCR_TOKEN` is a GitHub personal access token with `write:packages` scope.
-Create one at https://github.com/settings/tokens
 
 ## Step 1 — develop on a feature branch
 
@@ -189,36 +186,40 @@ git push origin main
 
 ## Step 3 — release
 
-From a clean `main` that is in sync with `origin`, run:
+From a clean `main` that is in sync with `origin`, just run:
 
 ```bash
-make release V=0.1.0
+make release
 ```
 
-That single command runs `scripts/release.sh`, which automates the **entire**
-release lifecycle:
+The script is interactive — it shows you the current version, suggests the next
+patch version, and asks you to confirm:
 
-1. **Validates prerequisites** — checks that `cargo`, `docker`, and `gh` are
-   installed and authenticated
-2. **Validates repository state** — ensures you are on `main`, the tree is
-   clean, local is in sync with `origin`, and the tag `v0.1.0` does not exist
-3. **Bumps version** — updates `Cargo.toml` and `Cargo.lock` to `0.1.0`
-4. **Lints and tests** — `cargo fmt --check`, `cargo clippy -D warnings`,
-   `cargo test` — the release fails if any of these fail
-5. **Builds binaries** — optimised `sendme` (CLI) and `sendme-balloon` (GUI)
-   for `x86_64-unknown-linux-gnu`
-6. **Packages tarballs** — `sendme-v0.1.0-linux-amd64.tar.gz` and
-   `sendme-balloon-v0.1.0-linux-amd64.tar.gz` in `dist/`
-7. **Builds and pushes container image** — tags `ghcr.io/imp1sh/sendme-balloon`
-   as `:0.1.0`, `:latest`, and `:sha-<git-hash>`, then pushes all three to GHCR
-8. **Commits, tags, and creates the release** — commits the version bump,
-   creates git tag `v0.1.0`, pushes both to `origin`, then creates a GitHub
-   Release with auto-generated changelog and the two tarballs as downloads
+```
+sendme-balloon release
+  Current version: 0.1.0
+  Suggested next:   0.1.1
 
-When the script finishes, the release is live:
+Release version [0.1.1]: _
+```
 
-- **Binaries**: https://github.com/imp1sh/sendme-balloon/releases/tag/v0.1.0
-- **Container**: `docker pull ghcr.io/imp1sh/sendme-balloon:0.1.0`
+Type a version (or press Enter to accept the suggestion), confirm, and the
+script does everything else:
+
+1. Bumps version in `Cargo.toml` and `Cargo.lock`
+2. Lints (`cargo fmt --check`, `cargo clippy -D warnings`) and tests — stops if
+   anything fails
+3. Builds optimised binaries (`sendme` CLI + `sendme-balloon` GUI, amd64)
+4. Packages tarballs into `dist/`
+5. Builds and pushes the container image to GHCR (`:version`, `:latest`,
+   `:sha-<hash>`)
+6. Commits, tags, and pushes to `origin`
+7. Creates a GitHub Release with auto-generated changelog and tarball downloads
+
+When it finishes, the release is live:
+
+- **Downloads**: https://github.com/imp1sh/sendme-balloon/releases
+- **Container**: `podman pull ghcr.io/imp1sh/sendme-balloon:<version>`
 
 ## Using the released binaries
 
@@ -232,8 +233,8 @@ tar xzf sendme-v0.1.0-linux-amd64.tar.gz
 ## Using the container image
 
 ```bash
-docker pull ghcr.io/imp1sh/sendme-balloon:latest
-docker run --rm -v "$PWD:/data" ghcr.io/imp1sh/sendme-balloon send /data/myfile
+podman pull ghcr.io/imp1sh/sendme-balloon:latest
+podman run --rm -v "$PWD:/data" ghcr.io/imp1sh/sendme-balloon send /data/myfile
 ```
 
 ## License
