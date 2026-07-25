@@ -313,8 +313,6 @@ incremental builds fast.
 | `x86_64-unknown-linux-musl` | CLI only | `linux-musl-amd64` |
 | `aarch64-unknown-linux-musl` | CLI only | `linux-musl-arm64` |
 | `x86_64-pc-windows-gnu` | CLI + GUI | `windows-amd64` |
-| `x86_64-unknown-freebsd` | CLI only | `freebsd-amd64` |
-| `aarch64-unknown-freebsd` | CLI only | `freebsd-arm64` |
 | `x86_64-apple-darwin` | CLI + GUI | `darwin-amd64` |
 | `aarch64-apple-darwin` | CLI + GUI | `darwin-arm64` |
 

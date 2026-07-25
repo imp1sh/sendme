@@ -10,7 +10,7 @@
 #   - validates repository state, lints, tests
 #   - asks for the next version, bumps Cargo.toml
 #   - builds EVERY target platform via hermetic containers (scripts/build.sh)
-#     → linux (gnu/musl, amd64/arm64), windows, macos, freebsd
+#     → linux (gnu/musl, amd64/arm64), windows, macos
 #   - packages archives + unified SHA256SUMS
 #   - builds & pushes the container image to GHCR
 #   - commits, tags, pushes, and creates a GitHub Release with all downloads
@@ -156,7 +156,7 @@ done
 echo ""
 printf "%b\n" "${B}Releasing ${G}${VERSION}${N}${B} tag ${TAG}${N}"
 echo ""
-printf "Platforms: linux (gnu/musl, amd64+arm64), windows, macos, freebsd,\n"
+printf "Platforms: linux (gnu/musl, amd64+arm64), windows, macos,\n"
 printf "           OCI image to GHCR.\n"
 echo ""
 

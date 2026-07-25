@@ -65,9 +65,6 @@ MATRIX=(
     # Windows gnu — amd64 (MinGW via Zig)
     "x86_64-pc-windows-gnu:sendme::false:base"
     "x86_64-pc-windows-gnu:sendme-balloon:balloon:true:base"
-    # FreeBSD — CLI only
-    "x86_64-unknown-freebsd:sendme::false:base"
-    "aarch64-unknown-freebsd:sendme::false:base"
     # macOS darwin — amd64 (needs Apple SDK)
     "x86_64-apple-darwin:sendme::false:darwin"
     "x86_64-apple-darwin:sendme-balloon:balloon:true:darwin"
@@ -85,8 +82,6 @@ suffix_for_triple() {
         aarch64-unknown-linux-musl) echo "linux-musl-arm64" ;;
         x86_64-pc-windows-gnu)     echo "windows-amd64" ;;
         aarch64-pc-windows-gnu)     echo "windows-arm64" ;;
-        x86_64-unknown-freebsd)     echo "freebsd-amd64" ;;
-        aarch64-unknown-freebsd)    echo "freebsd-arm64" ;;
         x86_64-apple-darwin)        echo "darwin-amd64" ;;
         aarch64-apple-darwin)       echo "darwin-arm64" ;;
         *) echo "UNKNOWN" ;;
@@ -238,8 +233,6 @@ if [[ "$DO_DIST" == "true" ]]; then
         [aarch64-unknown-linux-musl]="linux-musl-arm64"
         [x86_64-pc-windows-gnu]="windows-amd64"
         [aarch64-pc-windows-gnu]="windows-arm64"
-        [x86_64-unknown-freebsd]="freebsd-amd64"
-        [aarch64-unknown-freebsd]="freebsd-arm64"
         [x86_64-apple-darwin]="darwin-amd64"
         [aarch64-apple-darwin]="darwin-arm64"
     )

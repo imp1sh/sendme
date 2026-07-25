@@ -78,7 +78,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.91.0"
+          toolchain: "1.92.0"
           targets: ${{ matrix.target }}
 
       - uses: swatinem/rust-cache@v2
@@ -115,7 +115,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ── Container cross-builds (Linux musl, FreeBSD — CLI only) ───────────────
+  # ── Container cross-builds (Linux musl — CLI only) ────────────────────────
   build-cross:
     name: ${{ matrix.pkg }}
     runs-on: ubuntu-latest
@@ -125,8 +125,6 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-musl, pkg: sendme-x86_64-unknown-linux-musl }
           - { target: aarch64-unknown-linux-musl, pkg: sendme-aarch64-unknown-linux-musl }
-          - { target: x86_64-unknown-freebsd,    pkg: sendme-x86_64-unknown-freebsd }
-          - { target: aarch64-unknown-freebsd,   pkg: sendme-aarch64-unknown-freebsd }
 
     steps:
       - uses: actions/checkout@v4
@@ -238,8 +236,6 @@ jobs:
             [x86_64-pc-windows-msvc]=windows-amd64
             [x86_64-apple-darwin]=darwin-amd64
             [aarch64-apple-darwin]=darwin-arm64
-            [x86_64-unknown-freebsd]=freebsd-amd64
-            [aarch64-unknown-freebsd]=freebsd-arm64
           )
 
           shopt -s nullglob
