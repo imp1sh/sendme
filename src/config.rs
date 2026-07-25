@@ -107,12 +107,46 @@ fn default_offer_conn_close_wait() -> u64 {
     30
 }
 
+/// Notification urgency level, mirroring the freedesktop notification spec.
+///
+/// On most Linux daemons (GNOME, mako, dunst, Sway's built-in, …) the urgency
+/// controls the colour/style of the popup and how long it stays on screen:
+/// `low` may be quiet/transient, `normal` is the default popup, `critical`
+/// stays until dismissed. Serialized lowercase in YAML.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationUrgency {
+    Low,
+    #[default]
+    Normal,
+    Critical,
+}
+
+impl NotificationUrgency {
+    /// Convert to the `notify_rust` urgency enum used by the GUI binary.
+    #[cfg(feature = "balloon")]
+    pub fn to_notify_rust(&self) -> notify_rust::Urgency {
+        match self {
+            Self::Low => notify_rust::Urgency::Low,
+            Self::Normal => notify_rust::Urgency::Normal,
+            Self::Critical => notify_rust::Urgency::Critical,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NotificationConfig {
     /// Show a desktop notification for incoming transfer offers.
     #[serde(default = "default_notifications_enabled")]
     pub enabled: bool,
-    /// How long the notification stays on screen, in seconds.
+    /// Urgency level: `low`, `normal`, or `critical`. On Sway/mako/dunst this
+    /// controls the popup colour and whether it auto-expires or stays until
+    /// dismissed.
+    #[serde(default)]
+    pub urgency: NotificationUrgency,
+    /// How long the notification stays on screen, in seconds. Ignored when
+    /// urgency is `critical` (those stay until dismissed per the freedesktop
+    /// spec).
     #[serde(default = "default_notification_timeout")]
     pub timeout_seconds: u64,
 }
@@ -123,6 +157,7 @@ impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: default_notifications_enabled(),
+            urgency: NotificationUrgency::default(),
             timeout_seconds: default_notification_timeout(),
         }
     }
@@ -561,6 +596,22 @@ mod tests {
             cfg.notifications.timeout_seconds,
             default.notifications.timeout_seconds
         );
+        assert_eq!(cfg.notifications.urgency, default.notifications.urgency);
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn notification_urgency_parses_from_yaml() {
+        let yaml = "notifications:\n  urgency: critical\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.notifications.urgency, NotificationUrgency::Critical);
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn notification_urgency_defaults_to_normal() {
+        let cfg = Config::default();
+        assert_eq!(cfg.notifications.urgency, NotificationUrgency::Normal);
     }
 
     #[cfg(feature = "balloon")]

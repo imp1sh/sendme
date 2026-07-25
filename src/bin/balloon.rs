@@ -53,13 +53,22 @@ fn fire_notification(notif: &NotificationConfig, summary: &str, body: String) {
     if !notif.enabled {
         return;
     }
-    let timeout_ms = (notif.timeout_seconds.saturating_mul(1000)).max(1000);
+    let urgency = notif.urgency.to_notify_rust();
+    // Per the freedesktop spec, critical notifications should not auto-expire.
+    // Honour that regardless of the configured timeout_seconds.
+    let timeout = if urgency == notify_rust::Urgency::Critical {
+        notify_rust::Timeout::Never
+    } else {
+        let timeout_ms = (notif.timeout_seconds.saturating_mul(1000)).max(1000);
+        notify_rust::Timeout::Milliseconds(timeout_ms as u32)
+    };
     let summary = summary.to_string();
     std::thread::spawn(move || {
         let _ = notify_rust::Notification::new()
             .summary(&summary)
             .body(&body)
-            .timeout(notify_rust::Timeout::Milliseconds(timeout_ms as u32))
+            .urgency(urgency)
+            .timeout(timeout)
             .show();
     });
 }

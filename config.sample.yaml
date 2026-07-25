@@ -138,9 +138,10 @@
 # Uncomment the `notifications:` line and any individual child you want to
 # change; children left commented fall back to their own built-in defaults.
 #
-# defaults: enabled=true, timeout=10s
+# defaults: enabled=true, urgency=normal, timeout=10s
 # notifications:
 #   enabled: true
+#   urgency: normal
 #   timeout_seconds: 10
 
 # ── Logging ──────────────────────────────────────────────────────────────────
