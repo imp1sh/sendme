@@ -40,6 +40,10 @@ die()   { printf "${R}✗${N} %s\n" "$*" >&2; exit 1; }
 REPO_OWNER="imp1sh"
 REPO_NAME="sendme-balloon"
 IMAGE="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
+# Toolchain the release gate uses on the host.  Matches the pin in
+# Dockerfile.cross so lint/test catches the same issues the container builds
+# would (e.g. egui 0.35 requiring 1.92.0).
+REQUIRED_TOOLCHAIN="1.92.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DIST="$ROOT_DIR/dist"
@@ -52,10 +56,63 @@ bump_patch() {
     echo "${major}.${minor}.$((patch + 1))"
 }
 
+# Return 0 if $1 >= $2 (semver x.y.z), else 1.
+version_ge() {
+    local IFS=.
+    local a1 a2 a3 b1 b2 b3
+    read -r a1 a2 a3 <<< "$1"
+    read -r b1 b2 b3 <<< "$2"
+    a1=${a1:-0}; a2=${a2:-0}; a3=${a3:-0}
+    b1=${b1:-0}; b2=${b2:-0}; b3=${b3:-0}
+    (( a1 > b1 )) && return 0
+    (( a1 < b1 )) && return 1
+    (( a2 > b2 )) && return 0
+    (( a2 < b2 )) && return 1
+    (( a3 >= b3 ))
+}
+
+# Ensure a suitable Rust toolchain is available on the host.  Installs rustup
+# + the pinned toolchain if cargo is absent; otherwise ensures the pinned
+# toolchain is installed (via rustup) and selected for this session without
+# disturbing the user's global default.  Falls back to a version check for
+# non-rustup cargo installations.
+ensure_rust() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        info "cargo not found — installing rustup + Rust ${REQUIRED_TOOLCHAIN}..."
+        command -v curl >/dev/null 2>&1 || die "curl not found — install curl first"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "${REQUIRED_TOOLCHAIN}" \
+            || die "rustup installation failed"
+        # shellcheck disable=SC1091
+        . "$HOME/.cargo/env"
+        command -v cargo >/dev/null 2>&1 || die "cargo still not on PATH after install"
+        ok "Rust ${REQUIRED_TOOLCHAIN} installed"
+        return
+    fi
+
+    # cargo present — is it rustup-managed?
+    if command -v rustup >/dev/null 2>&1; then
+        rustup toolchain install "${REQUIRED_TOOLCHAIN}" --profile minimal >/dev/null 2>&1 \
+            || die "failed to install toolchain ${REQUIRED_TOOLCHAIN} via rustup"
+        # Pin the toolchain for THIS session only (does not change the user's
+        # global default), so every `cargo` call below uses the pinned version.
+        export RUSTUP_TOOLCHAIN="${REQUIRED_TOOLCHAIN}"
+        ok "using rustup toolchain ${REQUIRED_TOOLCHAIN} for this session"
+    else
+        # Non-rustup cargo (distro package, etc.) — just verify the version.
+        INSTALLED=$(rustc --version | awk '{print $2}')
+        if version_ge "$INSTALLED" "${REQUIRED_TOOLCHAIN}"; then
+            ok "host cargo ${INSTALLED} (>= ${REQUIRED_TOOLCHAIN})"
+        else
+            die "host cargo ${INSTALLED} is older than ${REQUIRED_TOOLCHAIN}; install rustup (https://rustup.rs) or upgrade Rust"
+        fi
+    fi
+}
+
 # ── 1. Prerequisites ───────────────────────────────────────────────────────
 info "Checking prerequisites..."
 
-command -v cargo  >/dev/null 2>&1 || die "cargo not found — install Rust: https://rustup.rs"
+ensure_rust
 command -v podman >/dev/null 2>&1 || die "podman not found — install: https://podman.io"
 command -v gh     >/dev/null 2>&1 || die "gh CLI not found — install: https://cli.github.com/"
 
