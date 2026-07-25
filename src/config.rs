@@ -306,6 +306,65 @@ impl Config {
             Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
         }
     }
+
+    /// Validate and sanitise the configuration in place.
+    ///
+    /// Catches semantic problems that serde cannot: a default save folder that
+    /// does not exist or is not writable, a chunk size of 0, etc. Problematic
+    /// values are corrected to safe fallbacks so the app keeps working, and a
+    /// human-readable warning is collected for each issue found. The caller
+    /// should surface these warnings to the user (e.g. via a critical desktop
+    /// notification) so they know what was adjusted and why.
+    pub fn validate(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        // default_save_folder: must exist, be a directory, and be writable.
+        // If any check fails, clear it so the folder picker is used instead —
+        // the user's transfers still work, they just pick the destination
+        // each time.
+        if let Some(folder) = self.default_save_folder.clone() {
+            if !folder.exists() {
+                warnings.push(format!(
+                    "default_save_folder «{}» does not exist. \
+                     The folder picker will be used instead.",
+                    folder.display()
+                ));
+                self.default_save_folder = None;
+            } else if !folder.is_dir() {
+                warnings.push(format!(
+                    "default_save_folder «{}» is not a directory. \
+                     The folder picker will be used instead.",
+                    folder.display()
+                ));
+                self.default_save_folder = None;
+            } else {
+                // Probe writability by creating and removing a temp file.
+                let probe = folder.join(".sendme-write-probe");
+                match std::fs::File::create(&probe) {
+                    Ok(_) => drop(std::fs::remove_file(&probe)),
+                    Err(e) => {
+                        warnings.push(format!(
+                            "default_save_folder «{}» is not writable ({}). \
+                             The folder picker will be used instead.",
+                            folder.display(),
+                            e
+                        ));
+                        self.default_save_folder = None;
+                    }
+                }
+            }
+        }
+
+        // chunk_size_mib: 0 would make chunk_size_bytes() return 0 and break
+        // every receive with "size too large". Clamp to the minimum of 1.
+        if self.chunk_size_mib == 0 {
+            warnings
+                .push("chunk_size_mib is 0 — clamped to 1 (the minimum usable value).".to_string());
+            self.chunk_size_mib = 1;
+        }
+
+        warnings
+    }
 }
 
 #[cfg(test)]
@@ -474,7 +533,10 @@ mod tests {
             "config.sample.yaml must be valid YAML that parses into Config (all keys commented)",
         );
         let default = Config::default();
-        assert!(cfg.default_save_folder.is_none(), "sample pins a save folder");
+        assert!(
+            cfg.default_save_folder.is_none(),
+            "sample pins a save folder"
+        );
         assert!(!cfg.auto_accept_offers, "sample enables auto-accept");
         assert!(matches!(cfg.relay_mode, RelayModeConfig::Default));
         assert_eq!(cfg.jobs, None);
@@ -498,6 +560,105 @@ mod tests {
         assert_eq!(
             cfg.notifications.timeout_seconds,
             default.notifications.timeout_seconds
+        );
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn validate_clears_nonexistent_save_folder() {
+        let mut cfg = Config {
+            default_save_folder: Some(PathBuf::from("/this/path/does/not/exist")),
+            ..Config::default()
+        };
+        let warnings = cfg.validate();
+        assert!(
+            cfg.default_save_folder.is_none(),
+            "folder should be cleared"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("does not exist")),
+            "expected a 'does not exist' warning, got: {warnings:?}"
+        );
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn validate_keeps_writable_save_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            default_save_folder: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let warnings = cfg.validate();
+        assert!(
+            cfg.default_save_folder.is_some(),
+            "a writable folder should be kept"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no warnings expected, got: {warnings:?}"
+        );
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn validate_clamps_zero_chunk_size() {
+        let mut cfg = Config {
+            chunk_size_mib: 0,
+            ..Config::default()
+        };
+        let warnings = cfg.validate();
+        assert_eq!(cfg.chunk_size_mib, 1, "should be clamped to 1");
+        assert!(
+            warnings.iter().any(|w| w.contains("chunk_size_mib")),
+            "expected a chunk_size warning, got: {warnings:?}"
+        );
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn validate_passes_clean_config_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            default_save_folder: Some(dir.path().to_path_buf()),
+            chunk_size_mib: 32,
+            ..Config::default()
+        };
+        let warnings = cfg.validate();
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got: {warnings:?}"
+        );
+        assert!(cfg.default_save_folder.is_some());
+        assert_eq!(cfg.chunk_size_mib, 32);
+    }
+
+    #[cfg(all(feature = "balloon", unix))]
+    #[test]
+    fn validate_clears_unwritable_save_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        // skip when running as root — root can write anywhere, so the
+        // writability probe would pass and the test would be meaningless.
+        if std::process::id() == 0 {
+            eprintln!("skipping validate_clears_unwritable_save_folder under root");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        let mut cfg = Config {
+            default_save_folder: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let warnings = cfg.validate();
+        // restore perms so tempdir cleanup works
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            cfg.default_save_folder.is_none(),
+            "unwritable folder should be cleared"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("not writable")),
+            "expected a 'not writable' warning, got: {warnings:?}"
         );
     }
 }

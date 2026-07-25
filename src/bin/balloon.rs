@@ -64,6 +64,26 @@ fn fire_notification(notif: &NotificationConfig, summary: &str, body: String) {
     });
 }
 
+/// Fire a CRITICAL desktop notification that stays on screen until dismissed.
+///
+/// Unlike [`fire_notification`], this ignores the user's
+/// `notifications.enabled` setting — config and validation errors must always
+/// surface, because a silent fallback to defaults would leave the user
+/// wondering why their settings "didn't take effect". On most Linux
+/// notification daemons (GNOME, mako, dunst, …) critical urgency keeps the
+/// notification visible until the user explicitly dismisses it.
+fn fire_critical_notification(summary: &str, body: String) {
+    let summary = summary.to_string();
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .urgency(notify_rust::Urgency::Critical)
+            .timeout(notify_rust::Timeout::Never)
+            .show();
+    });
+}
+
 /// Notification for an incoming transfer offer that awaits an Accept/Decline
 /// decision.
 ///
@@ -2011,10 +2031,34 @@ fn main() -> eframe::Result {
     // Initialise logging. The `RUST_LOG` environment variable, if set, takes
     // precedence; otherwise the `log_level` from config.yaml is used.
     use tracing_subscriber::EnvFilter;
-    let config = Config::load().unwrap_or_else(|e| {
-        eprintln!("warning: loading config failed, using defaults: {e:#}");
-        Config::default()
-    });
+
+    // Load and validate the config. On any error — a malformed YAML file,
+    // a wrong type, or a semantic issue like a missing/unwritable save folder
+    // — fire a CRITICAL desktop notification so the user actually notices.
+    // A silent fallback to defaults would leave them wondering why their
+    // settings "didn't take effect". The critical urgency keeps the
+    // notification on screen until dismissed on most Linux daemons.
+    let config = match Config::load() {
+        Ok(mut cfg) => {
+            let warnings = cfg.validate();
+            if !warnings.is_empty() {
+                fire_critical_notification("sendme-balloon: config issues", warnings.join("\n"));
+            }
+            cfg
+        }
+        Err(e) => {
+            fire_critical_notification(
+                "sendme-balloon: config error",
+                format!(
+                    "Could not read config.yaml — using default settings.\n\
+                     Please check the file for errors:\n{e:#}"
+                ),
+            );
+            Config::default()
+        }
+    };
+    // `validate()` may have mutated `config` (e.g. cleared a bad save folder),
+    // so re-sync the log_level from the possibly-corrected config.
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
