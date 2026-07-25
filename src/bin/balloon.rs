@@ -242,6 +242,7 @@ enum UiEvent {
     FilePickCancelled,
     SendStarted {
         name: String,
+        path: PathBuf,
     },
     Send(SendEvent),
     TicketInvalid(String),
@@ -288,8 +289,14 @@ enum UiState {
     },
     /// The data was transferred to a peer.
     SendDone { name: String },
-    /// The peer received the data but kept existing file(s).
-    SendKept { name: String },
+    /// The peer kept existing file(s) — the incoming file was NOT saved.
+    /// Carries the context needed for a one-click "Rename & Retry".
+    SendKept {
+        name: String,
+        original_path: PathBuf,
+        contact_node_id: EndpointId,
+        contact_name: String,
+    },
     /// Asking the user to paste a ticket.
     EnterTicket { error: Option<String> },
     /// The folder picker dialog is showing and the balloon is hidden.
@@ -394,6 +401,22 @@ struct BalloonApp {
     /// conflicts to resolve safely (keep existing) instead of prompting, so an
     /// unattended transfer never hangs waiting for a human decision.
     auto_accepted_active: bool,
+    /// The filesystem path of the file currently being sent, retained so a
+    /// "Rename & Retry" can copy and re-send it if the peer reports a name
+    /// collision.
+    last_send_path: Option<PathBuf>,
+    /// The contact (node id + name) we last sent an offer to, retained so a
+    /// retry can re-offer to the same contact without asking the user to pick
+    /// again.
+    last_offer_contact: Option<(EndpointId, String)>,
+    /// When set, the next `TicketReady` auto-fires a `SendOffer` to this
+    /// contact instead of going to the `Waiting` state. Used by "Rename &
+    /// Retry": the file is re-imported under a new name, and as soon as the
+    /// ticket is ready the offer is pushed automatically.
+    retry_contact: Option<(EndpointId, String)>,
+    /// Monotonically increasing retry counter, so successive renames produce
+    /// `photo (1).png`, `photo (2).png`, … Reset to 0 on every fresh send.
+    retry_count: u32,
 }
 
 impl BalloonApp {
@@ -420,6 +443,10 @@ impl BalloonApp {
             autostart_enabled: autostart_is_enabled(),
             offer_in_progress: false,
             auto_accepted_active: false,
+            last_send_path: None,
+            last_offer_contact: None,
+            retry_contact: None,
+            retry_count: 0,
         }
     }
 
@@ -447,8 +474,14 @@ impl BalloonApp {
                     self.state = UiState::Idle;
                 }
             }
-            UiEvent::SendStarted { name } => {
+            UiEvent::SendStarted { name, path } => {
                 if matches!(self.state, UiState::PickingFile | UiState::Preparing { .. }) {
+                    // A retry (retry_contact set) keeps its retry_count; a
+                    // fresh send resets it and remembers the original path.
+                    if self.retry_contact.is_none() {
+                        self.retry_count = 0;
+                        self.last_send_path = Some(path);
+                    }
                     self.state = UiState::Preparing { name };
                 }
             }
@@ -463,15 +496,39 @@ impl BalloonApp {
                     },
                     UiState::Preparing { .. } | UiState::PickingFile,
                 ) => {
-                    self.state = UiState::Waiting {
-                        ticket,
-                        name,
-                        size,
-                        kind,
-                        mime,
-                        peer: false,
-                        sent: 0,
-                    };
+                    // If a retry is pending (Rename & Retry), auto-fire the
+                    // offer to the same contact instead of going to Waiting.
+                    if let Some((node_id, contact_name)) = self.retry_contact.take() {
+                        self.last_offer_contact = Some((node_id, contact_name.clone()));
+                        self.send_cmd(Command::SendOffer {
+                            node_id,
+                            ticket: ticket.clone(),
+                            name: name.clone(),
+                            size,
+                            kind,
+                            mime: mime.clone(),
+                        });
+                        self.offer_in_progress = true;
+                        self.state = UiState::OfferPending {
+                            contact_name,
+                            ticket,
+                            name,
+                            size,
+                            kind,
+                            mime,
+                            sent: 0,
+                        };
+                    } else {
+                        self.state = UiState::Waiting {
+                            ticket,
+                            name,
+                            size,
+                            kind,
+                            mime,
+                            peer: false,
+                            sent: 0,
+                        };
+                    }
                 }
                 (SendEvent::PeerConnected, UiState::Waiting { peer, .. }) => {
                     *peer = true;
@@ -786,7 +843,17 @@ impl BalloonApp {
                     self.state,
                     UiState::OfferPending { .. } | UiState::Waiting { .. }
                 ) {
-                    self.state = UiState::SendKept { name };
+                    let original_path = self.last_send_path.clone().unwrap_or_default();
+                    let (contact_node_id, contact_name) = self
+                        .last_offer_contact
+                        .clone()
+                        .unwrap_or_else(|| (iroh::SecretKey::generate().public(), String::new()));
+                    self.state = UiState::SendKept {
+                        name,
+                        original_path,
+                        contact_node_id,
+                        contact_name,
+                    };
                 }
             }
             UiEvent::OfferRejected => {
@@ -817,6 +884,7 @@ impl BalloonApp {
         }
         self.offer_in_progress = false;
         self.auto_accepted_active = false;
+        self.retry_contact = None;
         match &self.state {
             UiState::PickingFile
             | UiState::Preparing { .. }
@@ -997,6 +1065,8 @@ impl BalloonApp {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             self.state = UiState::Preparing { name };
+            self.retry_count = 0;
+            self.last_send_path = Some(path.clone());
             self.send_cmd(Command::SendPath(path));
             return;
         }
@@ -1169,20 +1239,74 @@ impl BalloonApp {
                     self.state = UiState::Idle;
                 }
             }
-            UiState::SendKept { name } => {
+            UiState::SendKept {
+                name,
+                original_path,
+                contact_node_id,
+                contact_name,
+            } => {
                 self.title_bar(ui, ctx, "🎈 Send");
                 ui.add_space(8.0);
                 ui.colored_label(
-                    Color32::from_rgb(230, 160, 30),
+                    Color32::from_rgb(230, 90, 90),
                     format!(
-                        "\"{name}\" was received but the peer kept \
-                         existing file(s). Nothing was overwritten."
+                        "❌ \"{name}\" was NOT saved.\n\
+                         The receiver already has a file with this name."
                     ),
                 );
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "Ask \"{contact_name}\" to accept it under a different filename."
+                ));
                 ui.add_space(8.0);
-                if ui.button("OK").clicked() {
-                    self.state = UiState::Idle;
-                }
+                ui.horizontal(|ui| {
+                    // Rename & Retry: copy the file under a new name and
+                    // re-send + re-offer to the same contact automatically.
+                    let can_retry = original_path.is_file();
+                    if ui
+                        .add_enabled(can_retry, egui::Button::new("🔄 Rename & Retry"))
+                        .on_hover_text(if can_retry {
+                            "Copies the file under a new name (e.g. \"photo (1).png\") \
+                             and sends it to the same contact automatically."
+                        } else {
+                            "Rename & Retry is only available for single files, \
+                             not directories."
+                        })
+                        .clicked()
+                    {
+                        self.retry_count += 1;
+                        let orig_name = original_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| name.clone());
+                        let new_name = renamed_filename(&orig_name, self.retry_count);
+                        let temp_dir = std::env::temp_dir()
+                            .join(format!("sendme-retry-{}", uuid_like_suffix()));
+                        let temp_path = temp_dir.join(&new_name);
+                        // Copy synchronously — files are typically small for
+                        // this use case. A large file will briefly stall the
+                        // GUI, but that's acceptable for a one-click retry.
+                        match std::fs::create_dir_all(&temp_dir)
+                            .and_then(|_| std::fs::copy(&original_path, &temp_path))
+                        {
+                            Ok(_) => {
+                                self.retry_contact = Some((contact_node_id, contact_name.clone()));
+                                self.state = UiState::Preparing {
+                                    name: new_name.clone(),
+                                };
+                                self.send_cmd(Command::SendPath(temp_path));
+                            }
+                            Err(e) => {
+                                self.state = UiState::Error {
+                                    message: format!("cannot copy for retry: {e}"),
+                                };
+                            }
+                        }
+                    }
+                    if ui.button("OK").clicked() {
+                        self.state = UiState::Idle;
+                    }
+                });
             }
             UiState::EnterTicket { error } => {
                 self.title_bar(ui, ctx, "🎈 Receive");
@@ -1555,6 +1679,7 @@ impl BalloonApp {
                 }
                 ui.add_space(6.0);
                 if let Some((node_id, contact_name)) = chosen {
+                    self.last_offer_contact = Some((node_id, contact_name.clone()));
                     self.send_cmd(Command::SendOffer {
                         node_id,
                         ticket: ticket.clone(),
@@ -1742,6 +1867,28 @@ fn short_id(id: &str) -> String {
     }
 }
 
+/// Generate a short random suffix for temp directory names, avoiding an
+/// extra dependency on the `uuid` crate.
+fn uuid_like_suffix() -> String {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{nanos:09x}")
+}
+
+/// Generate a renamed filename by inserting ` (n)` before the extension.
+/// `photo.png` with retry=1 → `photo (1).png`, retry=2 → `photo (2).png`.
+/// Files without an extension get the suffix appended.
+fn renamed_filename(filename: &str, retry: u32) -> String {
+    let n = retry.max(1);
+    match filename.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem} ({n}).{ext}"),
+        None => format!("{filename} ({n})"),
+    }
+}
+
 fn start_send(
     path: PathBuf,
     cancel_send: &mut Option<oneshot::Sender<()>>,
@@ -1753,7 +1900,12 @@ fn start_send(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    evt_tx.send(UiEvent::SendStarted { name }).ok();
+    evt_tx
+        .send(UiEvent::SendStarted {
+            name,
+            path: path.clone(),
+        })
+        .ok();
     ctx.request_repaint();
 
     let (c_tx, c_rx) = oneshot::channel();
@@ -2132,6 +2284,10 @@ mod tests {
                 autostart_enabled: false,
                 offer_in_progress: false,
                 auto_accepted_active: false,
+                last_send_path: None,
+                last_offer_contact: None,
+                retry_contact: None,
+                retry_count: 0,
             },
             cmd_rx,
         )
@@ -2167,6 +2323,7 @@ mod tests {
 
         app.apply(UiEvent::SendStarted {
             name: "example.txt".into(),
+            path: PathBuf::from("example.txt"),
         });
         assert!(matches!(app.state, UiState::Idle));
     }
@@ -2192,6 +2349,23 @@ mod tests {
     fn short_id_preserves_short_ids() {
         let id = "abc";
         assert_eq!(short_id(id), "abc");
+    }
+
+    #[test]
+    fn renamed_filename_inserts_counter_before_extension() {
+        assert_eq!(renamed_filename("photo.png", 1), "photo (1).png");
+        assert_eq!(renamed_filename("photo.png", 2), "photo (2).png");
+        assert_eq!(renamed_filename("archive.tar.gz", 1), "archive.tar (1).gz");
+    }
+
+    #[test]
+    fn renamed_filename_handles_no_extension() {
+        assert_eq!(renamed_filename("README", 1), "README (1)");
+    }
+
+    #[test]
+    fn renamed_filename_clamps_to_minimum_one() {
+        assert_eq!(renamed_filename("photo.png", 0), "photo (1).png");
     }
 
     #[test]
