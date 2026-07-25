@@ -351,7 +351,7 @@ script does everything else:
    anything fails
 3. Builds **every target platform** via hermetic containers (see
    [Cross-platform builds](#cross-platform-builds)): linux (gnu/musl, amd64 +
-   arm64), windows, macOS, FreeBSD
+   arm64), windows, macOS, FreeBSD (amd64, CLI)
 4. Packages archives + a unified `SHA256SUMS` into `dist/`
 5. Builds and pushes the container image to GHCR (`:version`, `:latest`,
    `:sha-<hash>`)

@@ -13,7 +13,8 @@ name: release
 #     licensed (macOS on Apple-sanctioned runners, Windows MSVC on Microsoft
 #     runners, Linux gnu on ubuntu amd64+arm64).
 #   • Hermetic container cross-builds only where no native runner exists:
-#     Linux musl and FreeBSD (CLI only), via Dockerfile.cross + cargo-zigbuild.
+#     Linux musl and FreeBSD (CLI only), via Dockerfile.cross (cargo-zigbuild
+#     for musl, clang/lld + FreeBSD sysroot for FreeBSD).
 #   • A parallel job builds & pushes the OCI image and signs it keyless.
 #   • A final job gathers every binary, packages versioned archives, emits a
 #     unified SHA256SUMS, signs it keyless (sigstore/cosign, GitHub OIDC — no

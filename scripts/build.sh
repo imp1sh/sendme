@@ -13,6 +13,11 @@
 # (see scripts/fetch-macos-sdk.sh).  If it is absent, darwin targets are
 # skipped with a warning rather than failing the whole run.
 #
+# FreeBSD (x86_64-unknown-freebsd, CLI only) is self-contained: the freebsd
+# build stage in Dockerfile.cross fetches the FreeBSD 14.3-RELEASE base.txz
+# and builds a clang/lld cross toolchain + sysroot inside the container, so
+# no host-side setup is required.
+#
 # Usage:
 #   ./scripts/build.sh                # build all targets, extract to dist/
 #   ./scripts/build.sh --dist         # also package archives + SHA256SUMS
@@ -69,6 +74,8 @@ MATRIX=(
     # Windows gnu — amd64 (MinGW via Zig)
     "x86_64-pc-windows-gnu:sendme::false:base"
     "x86_64-pc-windows-gnu:sendme-balloon:balloon:true:base"
+    # FreeBSD — CLI only (clang/lld + FreeBSD sysroot; no balloon)
+    "x86_64-unknown-freebsd:sendme::false:freebsd"
     # macOS darwin — amd64 (needs Apple SDK)
     "x86_64-apple-darwin:sendme::false:darwin"
     "x86_64-apple-darwin:sendme-balloon:balloon:true:darwin"
@@ -86,6 +93,7 @@ suffix_for_triple() {
         aarch64-unknown-linux-musl) echo "linux-musl-arm64" ;;
         x86_64-pc-windows-gnu)     echo "windows-amd64" ;;
         aarch64-pc-windows-gnu)     echo "windows-arm64" ;;
+        x86_64-unknown-freebsd)     echo "freebsd-amd64" ;;
         x86_64-apple-darwin)        echo "darwin-amd64" ;;
         aarch64-apple-darwin)       echo "darwin-arm64" ;;
         *) echo "UNKNOWN" ;;
@@ -201,6 +209,8 @@ for e in "${MATRIX[@]}"; do
     )
     if [[ "$stage" == "darwin" ]]; then
         args+=(--build-arg "CROSS_STAGE=darwin" --build-context "applesdk=$ROOT_DIR/sdks")
+    elif [[ "$stage" == "freebsd" ]]; then
+        args+=(--build-arg "CROSS_STAGE=freebsd")
     fi
 
     if podman build "${args[@]}" "$ROOT_DIR" 2>&1 | sed 's/^/    /'; then
@@ -237,6 +247,7 @@ if [[ "$DO_DIST" == "true" ]]; then
         [aarch64-unknown-linux-musl]="linux-musl-arm64"
         [x86_64-pc-windows-gnu]="windows-amd64"
         [aarch64-pc-windows-gnu]="windows-arm64"
+        [x86_64-unknown-freebsd]="freebsd-amd64"
         [x86_64-apple-darwin]="darwin-amd64"
         [aarch64-apple-darwin]="darwin-arm64"
     )

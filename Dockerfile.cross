@@ -8,7 +8,7 @@
 #
 #   Linux  gnu/musl  (amd64, arm64)
 #   Windows gnu      (amd64)                 — MinGW via Zig
-#   FreeBSD          (amd64, arm64)
+#   FreeBSD          (amd64)                 — clang/lld + FreeBSD sysroot
 #   macOS  darwin     (amd64, arm64)         — needs the Apple SDK (see below)
 #
 # The GUI (sendme-balloon) is built only for targets whose platform GUI
@@ -37,10 +37,12 @@
 #   x86_64-unknown-linux-gnu    aarch64-unknown-linux-gnu
 #   x86_64-unknown-linux-musl   aarch64-unknown-linux-musl
 #   x86_64-pc-windows-gnu       aarch64-pc-windows-gnu
+#   x86_64-unknown-freebsd                             (needs CROSS_STAGE=freebsd)
 #   x86_64-apple-darwin         aarch64-apple-darwin   (needs Apple SDK)
 #
-# Reconstructibility pins: Rust 1.92.0, Zig 0.13.0, Debian bookworm base,
-# Cargo.lock committed.  BuildKit cache mounts reuse compiled deps across runs.
+# Reconstructibility pins: Rust 1.92.0, Zig 0.13.0, Debian bookworm base
+# (clang/lld 14 for FreeBSD), FreeBSD 14.3-RELEASE sysroot, Cargo.lock
+# committed.  BuildKit cache mounts reuse compiled deps across runs.
 
 # ── Stage selector ─────────────────────────────────────────────────────────
 # CROSS_STAGE picks whether the Apple SDK is injected.  Defaults to `base`
@@ -80,6 +82,39 @@ ENV SDKROOT=/opt/MacOSX.sdk \
     DEVELOPER_DIR=/opt \
     MACOSX_DEPLOYMENT_TARGET=11.0
 
+# ── freebsd: clang/lld cross toolchain + FreeBSD sysroot ───────────────────
+# Zig ships no FreeBSD libc headers, so it cannot compile C code (ring, etc.)
+# for FreeBSD.  Instead we use Debian's clang/lld — a native cross-compiler —
+# with a sysroot extracted from the FreeBSD base.txz.  clang accepts the Rust
+# triple x86_64-unknown-freebsd directly (unlike zig, which wants the vendor
+# field stripped), and lld honours --sysroot for FreeBSD's libc.so linker
+# script.  Wrappers expose clang as the target CC/LINKER; the builder stage
+# below selects plain `cargo build` for this target (no cargo-zigbuild).
+FROM bootstrap AS freebsd
+ARG FREEBSD_VERSION=14.3-RELEASE
+RUN apt-get update && apt-get install -y --no-install-recommends clang lld llvm \
+ && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /opt/fb \
+ && curl -fL -o /tmp/base.txz \
+      "https://download.freebsd.org/ftp/releases/amd64/${FREEBSD_VERSION}/base.txz" \
+ && ( cd /opt/fb && tar xf /tmp/base.txz ./lib ./usr/lib ./usr/include ./usr/libdata 2>/dev/null \
+      || ( cd /opt/fb && tar xf /tmp/base.txz ./lib ./usr/lib ./usr/include ) ) \
+ && rm -f /tmp/base.txz
+RUN mkdir -p /opt/wrap \
+ && printf '%s\n' '#!/usr/bin/env bash' \
+        'exec clang --target=x86_64-unknown-freebsd --sysroot=/opt/fb -fuse-ld=lld -isystem /opt/fb/usr/include "$@"' \
+        > /opt/wrap/cc-freebsd \
+ && printf '%s\n' '#!/usr/bin/env bash' \
+        'exec clang++ --target=x86_64-unknown-freebsd --sysroot=/opt/fb -fuse-ld=lld -isystem /opt/fb/usr/include "$@"' \
+        > /opt/wrap/cxx-freebsd \
+ && chmod +x /opt/wrap/cc-freebsd /opt/wrap/cxx-freebsd
+ENV CC_x86_64_unknown_freebsd=/opt/wrap/cc-freebsd \
+    CXX_x86_64_unknown_freebsd=/opt/wrap/cxx-freebsd \
+    AR_x86_64_unknown_freebsd=llvm-ar \
+    CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=/opt/wrap/cc-freebsd \
+    CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUSTFLAGS="-L native=/opt/fb/lib -L native=/opt/fb/usr/lib" \
+    BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_freebsd="--sysroot=/opt/fb -isystem /opt/fb/usr/include"
+
 # ── builder: deps layer + real build ───────────────────────────────────────
 FROM ${CROSS_STAGE} AS builder
 ARG TARGET
@@ -106,21 +141,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && printf 'fn main() {}\n' > src/main.rs \
  && printf 'fn main() {}\n' > src/bin/balloon.rs \
  && FEAT=""; [ -n "$FEATURES" ] && FEAT="--features $FEATURES"; \
-    ( if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then \
+    ( if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] || [ "$TARGET" = "x86_64-unknown-freebsd" ]; then \
           cargo build --release --locked --target "$TARGET" $FEAT --bin "$BIN"; \
       else \
           cargo zigbuild --release --locked --target "$TARGET" $FEAT --bin "$BIN"; \
       fi ) || true
 
-# Real build.  The container's native triple (x86_64-unknown-linux-gnu) uses
-# plain `cargo build`; every other target uses `cargo zigbuild`.
+# Real build.  The container's native triple (x86_64-unknown-linux-gnu) and
+# the FreeBSD target (clang/lld, no cargo-zigbuild) use plain `cargo build`;
+# every other target uses `cargo zigbuild`.
 COPY src/ src/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     set -eux; \
     FEAT=""; [ -n "$FEATURES" ] && FEAT="--features $FEATURES"; \
     EXT=""; echo "$TARGET" | grep -q -- 'pc-windows' && EXT=".exe"; \
-    if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then \
+    if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] || [ "$TARGET" = "x86_64-unknown-freebsd" ]; then \
         cargo build --release --locked --target "$TARGET" $FEAT --bin "$BIN"; \
     else \
         cargo zigbuild --release --locked --target "$TARGET" $FEAT --bin "$BIN"; \
