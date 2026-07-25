@@ -145,10 +145,13 @@ cargo build --release
 cargo build --release --features balloon
 ```
 
-### Cross-compiling from Linux
+### Cross-compiling for macOS from Linux
 
-See [Cross-platform builds](#cross-platform-builds) for building macOS (and
-other platform) binaries from an amd64 Linux host using hermetic containers.
+If you are on Linux and want to produce macOS binaries (e.g. as the maintainer
+doing a release), see [Cross-platform builds](#cross-platform-builds) below.
+That path uses hermetic containers and requires the Apple SDK to be fetched
+once via `make fetch-sdk`. If you are on a Mac, ignore this — build natively
+as described above.
 
 # Usage
 
@@ -361,9 +364,14 @@ When it finishes, the release is live:
 
 ## Cross-platform builds
 
+> **Building on your own platform?** See [Build from source](#build-from-source)
+> above — native builds are simpler and need no SDK extraction. This section
+> is for **building every target from an amd64 Linux host** (the maintainer's
+> release workflow).
+
 All release targets are cross-compiled from an amd64 Linux host using hermetic
 containers — no target-platform toolchains need to be installed on the host.
-Each target builds inside a pinned container (`Dockerfile.cross`, Rust 1.91.0 +
+Each target builds inside a pinned container (`Dockerfile.cross`, Rust 1.92.0 +
 Zig 0.13.0 via `cargo-zigbuild`), so every build is reconstructible from the
 committed `Cargo.lock` + `Dockerfile.cross`, and BuildKit cache mounts keep
 incremental builds fast.
