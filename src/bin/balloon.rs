@@ -1313,8 +1313,9 @@ impl BalloonApp {
                 self.title_bar(ui, ctx, "🎈 Receive");
                 ui.add_space(8.0);
                 ui.colored_label(
-                    RECV_COLOR,
-                    "✓ kept the existing file(s), nothing was overwritten.",
+                    Color32::from_rgb(230, 160, 30),
+                    "The incoming file was discarded — a file with the same \
+                     name already exists. Nothing was overwritten.",
                 );
                 ui.add_space(4.0);
                 ui.label(format!("save folder: {}", target.display()));
