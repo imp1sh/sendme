@@ -76,15 +76,79 @@ WM config manually.
 
 ## Build from source
 
-The desktop app is gated behind the `balloon` feature, which is not enabled by
-default, so it has to be enabled explicitly:
+### Prerequisites
 
-```
+| Platform | Requirements |
+|----------|--------------|
+| **macOS** | Xcode Command Line Tools (`xcode-select --install`), Rust 1.92+ ([rustup.rs](https://rustup.rs)) |
+| **Linux** | Rust 1.92+, plus for the GUI: `libgtk-3-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev` (apt) or `gtk3-devel libxcb-devel libxkbcommon-devel openssl-devel` (dnf) |
+| **Windows** | Visual Studio Build Tools (MSVC), Rust 1.92+ |
+
+### macOS
+
+On macOS the build is straightforward — no extra system libraries are needed
+because the GUI stack (Metal, AppKit) ships with the system SDK via Xcode
+Command Line Tools.
+
+```bash
+# One-time: install Xcode Command Line Tools
+xcode-select --install
+
+# One-time: install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Clone
+git clone https://github.com/imp1sh/sendme-balloon.git
+cd sendme-balloon
+
+# Build the CLI only
+cargo build --release
+# → target/release/sendme
+
+# Build the CLI + desktop app (balloon GUI)
+cargo build --release --features balloon
+# → target/release/sendme
+# → target/release/sendme-balloon
+
+# Or install directly to ~/.cargo/bin
 cargo install sendme --features balloon
 ```
 
-This installs both the `sendme` command-line tool and the `sendme-balloon`
-desktop app. Building without `--features balloon` yields only the CLI.
+The resulting binaries are native Mach-O executables for your Mac's
+architecture (Apple Silicon or Intel). To cross-compile for the other
+macOS architecture from the same machine:
+
+```bash
+# On an Apple Silicon Mac, also build for Intel:
+rustup target add x86_64-apple-darwin
+cargo build --release --target x86_64-apple-darwin --features balloon
+
+# On an Intel Mac, also build for Apple Silicon:
+rustup target add aarch64-apple-darwin
+cargo build --release --target aarch64-apple-darwin --features balloon
+```
+
+### Linux
+
+```bash
+# Install GUI build dependencies (needed for the balloon feature)
+# Fedora:
+sudo dnf install gtk3-devel libxcb-devel libxkbcommon-devel openssl-devel
+# Debian/Ubuntu:
+sudo apt-get install libgtk-3-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+# Build the CLI only
+cargo build --release
+
+# Build the CLI + desktop app
+cargo build --release --features balloon
+```
+
+### Cross-compiling from Linux
+
+See [Cross-platform builds](#cross-platform-builds) for building macOS (and
+other platform) binaries from an amd64 Linux host using hermetic containers.
 
 # Usage
 
