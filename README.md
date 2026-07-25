@@ -185,7 +185,9 @@ transfers behave just like the command-line tool.
 
 - **Click** the green lower half of the balloon and paste the ticket (the whole
   `sendme receive ...` command is accepted too).
-- Choose where to save in the folder dialog that appears.
+- Choose where to save in the folder dialog that appears — unless a
+  `default_save_folder` is set in `config.yaml`, in which case files go there
+  directly and the dialog is skipped.
 - A progress bar tracks the download. On success the saved location is shown.
 
 ### Address book & direct ticket sharing
@@ -235,7 +237,8 @@ Linux):
 | Path | Purpose |
 |------|---------|
 | `~/.config/sendme-balloon/secret.key` | Your persistent iroh secret key (32 bytes, hex-encoded). Determines your stable 256-bit node id that others add to their address book. Generated automatically on first run. |
-| `~/.config/sendme-balloon/addressbook.json` | Your address book — a JSON array of contacts (nickname + node id). Created on first save. |
+| `~/.config/sendme-balloon/addressbook.json` | Your address book — a JSON array of contacts (nickname + node id, plus optional email and per-contact auto-accept flag). Created on first save. Older files without the newer fields keep loading. |
+| `~/.config/sendme-balloon/config.yaml` | Optional YAML configuration for the balloon (default save folder, auto-accept, relay mode, timeouts, notifications, log level, …). Not created automatically; copy `config.sample.yaml` from the repository and edit it by hand. When absent, built-in defaults are used. |
 
 The directory is created automatically on first use. To reset the app to a
 fresh state, delete the directory:
@@ -246,6 +249,36 @@ rm -rf ~/.config/sendme-balloon
 
 Note that deleting `secret.key` changes your node id, so existing contacts
 would need to re-add you.
+
+### Configuration
+
+The balloon reads `~/.config/sendme-balloon/config.yaml` on startup. The file is
+optional and is never written by the GUI — edit it by hand. A fully commented
+template ships in the repository as `config.sample.yaml`:
+
+```bash
+cp config.sample.yaml ~/.config/sendme-balloon/config.yaml
+```
+
+Highlights:
+
+- **`default_save_folder`** — when set, incoming transfers land here and the
+  folder-picker dialog is skipped, for manual receives and for offers alike.
+- **`auto_accept_offers`** — accept incoming offers without prompting. Requires
+  a `default_save_folder`; ignored until one is set. ⚠ anyone who knows your
+  node id can push files to you.
+- **per-contact auto-accept** — in the address book, each contact has an
+  optional email field and an "auto" checkbox. A contact with auto-accept on is
+  accepted automatically even if the global switch is off (still needs a
+  `default_save_folder`).
+- **`conflict_default`** — `ask` (default), `overwrite`, or `keep_existing`
+  when an incoming file already exists. Auto-accepted transfers with `ask`
+  fall back to `keep_existing` so they never hang.
+- **`relay_mode`**, **`chunk_size_mib`**, **`jobs`**, **`timeouts`**,
+  **`heartbeat_interval_secs`**, **`notifications`**, **`log_level`** — see the
+  sample file for details.
+
+The `RUST_LOG` environment variable, if set, overrides `log_level`.
 
 ## Command-line usage
 

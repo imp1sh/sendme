@@ -1,0 +1,169 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# sendme-balloon configuration
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This file is NOT created automatically. To configure the balloon, copy it to
+#   ~/.config/sendme-balloon/config.yaml
+# (or wherever $XDG_CONFIG_HOME points) and edit it by hand in any text editor.
+#
+# The GUI never writes to this file.
+#
+# ── How to use this file ─────────────────────────────────────────────────────
+#
+# EVERY option below is commented out, and the value you see IS the built-in
+# default compiled into the binary. Copying this file verbatim therefore
+# produces an EMPTY config — every key is absent, so the app uses its compiled
+# defaults, exactly as if no config file existed.
+#
+# To change a setting, uncomment that ONE line (remove the leading "# ") and
+# edit the value. Leave everything else commented out. This way, when a future
+# sendme-balloon release changes a built-in default, that change reaches you
+# automatically — it is NOT silently overridden by a stale value copied from an
+# old sample file. Only the handful of knobs you explicitly touched stay pinned.
+#
+# Indentation matters — keep it as shown. Partial uncommenting of a block works
+# too: e.g. uncomment `timeouts:` and just `router_shutdown_secs:`; the two you
+# left commented fall back to their built-in defaults.
+#
+# NOTE: this only affects the sendme-balloon desktop app. The `sendme`
+# command-line tool is configured exclusively through its flags and environment
+# variables (see `sendme --help`) and is intentionally left untouched so it
+# stays interchangeable with the upstream sendme application.
+
+# ── Incoming transfers ──────────────────────────────────────────────────────
+
+# Default folder for incoming transfers. When set, the folder-picker dialog is
+# SKIPPED and every incoming file lands here — for manual "paste a ticket"
+# receives as well as for transfers pushed by a contact.
+#
+# A leading "~" expands to your home directory. Relative paths are resolved
+# against the current working directory and are not recommended.
+#
+# Leaving this unset (commented out) preserves the original behaviour: the app
+# asks you where to save on every single transfer.
+#
+# default: unset (ask every time)
+# default_save_folder: ~/Downloads/sendme
+
+# Automatically accept incoming transfer offers WITHOUT an Accept/Decline
+# prompt.
+#
+#   ⚠  SECURITY WARNING  ⚠
+#   Anyone who knows your node id can push files to your machine with NO
+#   interaction from you. Treat this like leaving your front door open.
+#   Only enable this if you trust the sources, and ALWAYS set
+#   default_save_folder first — auto-accept is silently ignored until a
+#   default folder is configured, because there would be nowhere to save.
+#
+# A per-contact "auto accept" checkbox in the address book overrides this for
+# that one contact: a contact with auto-accept on is accepted automatically
+# even if this global switch is false, and vice-versa.
+#
+# When a transfer is auto-accepted you are still notified (a desktop
+# notification, see `notifications` below) and the balloon shows the ongoing
+# download, so files never appear on disk completely silently.
+#
+# default: false
+# auto_accept_offers: false
+
+# What to do when an incoming transfer would overwrite a file that already
+# exists in the destination folder.
+#
+#   ask            — prompt every time (the original behaviour)
+#   overwrite      — silently replace the existing file(s)
+#   keep_existing  — silently keep the existing file(s); skip the incoming ones
+#
+# For unattended use (auto-accept) you almost certainly want "overwrite" or
+# "keep_existing": with "ask" the transfer would block forever waiting for a
+# human. When an auto-accepted transfer hits a conflict while this is "ask",
+# the balloon falls back to "keep_existing" so it never hangs.
+#
+# default: ask
+# conflict_default: ask
+
+# ── Networking ───────────────────────────────────────────────────────────────
+
+# Relay mode. Relays are iroh's fallback when direct NAT hole-punching fails.
+#
+#   default    — use n0's public relay servers (recommended)
+#   disabled   — no relays; direct connections only (may fail behind strict NATs)
+#   https://…  — your own self-hosted relay server URL
+#
+# An invalid URL falls back to "default" with a warning in the log.
+#
+# default: default
+# relay_mode: default
+
+# Number of parallel jobs used while importing files on the send side. null
+# means "use all logical CPU cores" (the same default as the CLI's -j flag).
+# Lower this if the balloon competes for CPU with other work.
+#
+# default: null (all logical cores)
+# jobs: null
+# jobs: 4
+
+# Chunk size (mebibytes) used while downloading. Larger chunks mean fewer
+# round-trips but more memory; smaller chunks suit memory-constrained devices.
+#
+# default: 32
+# chunk_size_mib: 32
+
+# ── Timeouts (seconds) ───────────────────────────────────────────────────────
+# These mirror values that were previously hardcoded. Most users can leave
+# the whole block commented out.
+#
+# Uncomment the `timeouts:` line and any individual child you want to change;
+# children left commented fall back to their own built-in defaults.
+#
+# defaults: 30 / 2 / 30
+# timeouts:
+#   endpoint_online_wait_secs: 30
+#   router_shutdown_secs: 2
+#   offer_conn_close_wait_secs: 30
+
+# Heartbeat interval (seconds) for the contact-offer stream. The receiver
+# sends a heartbeat byte periodically while its user is still deciding whether
+# to accept, and while a transfer is in progress, to keep the QUIC connection
+# alive across what may be a multi-minute human pause. Lower is safer on flaky
+# links; higher saves bandwidth.
+#
+# default: 3
+# heartbeat_interval_secs: 3
+
+# ── Notifications ────────────────────────────────────────────────────────────
+# Desktop notifications for incoming transfer offers and for auto-accepted
+# transfers. If no notification daemon is running the balloon's own visual
+# change is the fallback.
+#
+# Uncomment the `notifications:` line and any individual child you want to
+# change; children left commented fall back to their own built-in defaults.
+#
+# defaults: enabled=true, timeout=10s
+# notifications:
+#   enabled: true
+#   timeout_seconds: 10
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# One of: error, warn, info, debug, trace.
+# The RUST_LOG environment variable, if set, overrides this value.
+#
+# default: warn
+# log_level: warn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Options the CLI exposes but the balloon intentionally does NOT expose here:
+#
+#   --magic-ipv4-addr / --magic-ipv6_addr  (bind a fixed UDP port)
+#       The balloon auto-hole-punches; a fixed port is a footgun for GUI use.
+#
+#   --format (hex/cid)                     (hash display format)
+#       The balloon prints no hashes to a terminal, so this has no effect.
+#
+#   --ticket-type                          (what info the ticket carries)
+#       The balloon always uses the fullest ticket for best connectivity.
+#
+#   --show-secret, --no-progress, -c/--clipboard
+#       CLI-only display/behaviour switches with no GUI equivalent.
+#
+# If you need any of these, use the `sendme` command-line tool instead.
+# ─────────────────────────────────────────────────────────────────────────────

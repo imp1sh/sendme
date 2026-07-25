@@ -48,6 +48,7 @@ dirs = { version = "5", optional = true }
 serde_json = { version = "1", optional = true }
 notify-rust = { version = "4", optional = true }
 mime_guess = { version = "2", optional = true }
+serde_yaml = { version = "0.9", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.174", optional = true }
@@ -66,7 +67,7 @@ tempfile = "3.8.1"
 
 [features]
 clipboard = ["dep:crossterm", "dep:windows-sys", "dep:libc"]
-balloon = ["dep:eframe", "dep:rfd", "dep:winit", "dep:dirs", "dep:serde_json", "dep:notify-rust", "dep:mime_guess"]
+balloon = ["dep:eframe", "dep:rfd", "dep:winit", "dep:dirs", "dep:serde_json", "dep:notify-rust", "dep:mime_guess", "dep:serde_yaml"]
 default = ["clipboard"]
 
 [[bin]]

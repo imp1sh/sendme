@@ -2,6 +2,7 @@
 //! `sendme-balloon` desktop app.
 
 pub mod balloon;
+pub mod config;
 #[cfg(feature = "balloon")]
 pub mod contacts;
 
