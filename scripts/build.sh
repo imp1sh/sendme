@@ -44,6 +44,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Shared lifecycle helpers (logging, version_ge, detect_pm, ensure_tool).
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/common.sh"
+
 DIST="$ROOT_DIR/dist"
 STAGING="$DIST/staging"
 DOCKERFILE="$ROOT_DIR/Dockerfile.cross"
@@ -142,7 +146,7 @@ if [[ "$DO_LIST" == "true" ]]; then
 fi
 
 # ── Prerequisites ──────────────────────────────────────────────────────────
-command -v podman >/dev/null 2>&1 || die "podman not found — install: https://podman.io"
+ensure_tool podman
 [[ -f "$DOCKERFILE" ]] || die "Dockerfile.cross not found at $DOCKERFILE"
 
 # ── SDK availability ───────────────────────────────────────────────────────
