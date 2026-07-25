@@ -10,7 +10,9 @@
 maintained by [Jochen Demmer](mailto:jochen@winteltosh.de). 
 
 BE WARNED
-All adjustments are fully vibe coded as an experiment. So far it seems to be working just fine.
+
+All adjustments are fully vibe coded as an experiment. So far it seems to be working just fine. Yet this app is only tested on linux amd64 so far.
+
 BE WARNED
 
 The original project
