@@ -31,7 +31,13 @@ async fn balloon_send_receive() -> anyhow::Result<()> {
     let ticket = parse_ticket(&format!("sendme receive {ticket}"))?;
 
     let (re_tx, mut re_rx) = mpsc::channel(64);
-    tokio::spawn(receive_ticket(ticket, tgt_dir.path().to_path_buf(), re_tx));
+    let (_decide_tx, decide_rx) = oneshot::channel();
+    tokio::spawn(receive_ticket(
+        ticket,
+        tgt_dir.path().to_path_buf(),
+        re_tx,
+        decide_rx,
+    ));
     // wait for the receiver to finish
     loop {
         match tokio::time::timeout(Duration::from_secs(60), re_rx.recv()).await? {

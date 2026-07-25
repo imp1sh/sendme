@@ -32,7 +32,71 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-use crate::{apply_options, export, get_or_create_secret, import, AddrInfoOptions};
+use crate::{
+    apply_options, export, export_conflicts, get_or_create_secret, import, AddrInfoOptions,
+};
+
+/// Whether an offered transfer is a single file or a directory.
+///
+/// Carried through the offer protocol so the receiver can show the kind of
+/// the incoming transfer before deciding whether to accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    File,
+    Directory,
+}
+
+/// Wire byte for [`FileKind::File`].
+pub const KIND_FILE: u8 = 0;
+/// Wire byte for [`FileKind::Directory`].
+pub const KIND_DIRECTORY: u8 = 1;
+
+impl FileKind {
+    /// Encode this kind as a single wire byte.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            FileKind::File => KIND_FILE,
+            FileKind::Directory => KIND_DIRECTORY,
+        }
+    }
+
+    /// Decode a kind from a single wire byte.
+    pub fn from_byte(b: u8) -> anyhow::Result<Self> {
+        match b {
+            KIND_FILE => Ok(FileKind::File),
+            KIND_DIRECTORY => Ok(FileKind::Directory),
+            other => anyhow::bail!("unknown file kind byte: {other}"),
+        }
+    }
+
+    /// A short, human-readable label suitable for the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            FileKind::File => "file",
+            FileKind::Directory => "directory",
+        }
+    }
+}
+
+/// Guess the MIME type of `path` from its extension. Returns an empty string
+/// for directories (which have no meaningful MIME type) and for the
+/// non-balloon build (where [`mime_guess`] is not available).
+fn guess_mime(path: &std::path::Path) -> String {
+    if path.is_dir() {
+        return String::new();
+    }
+    #[cfg(feature = "balloon")]
+    {
+        mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .to_string()
+    }
+    #[cfg(not(feature = "balloon"))]
+    {
+        let _ = path;
+        String::new()
+    }
+}
 
 /// Events emitted while providing (sending) data.
 #[derive(Debug, Clone)]
@@ -42,6 +106,10 @@ pub enum SendEvent {
         ticket: String,
         name: String,
         size: u64,
+        /// Whether the offered path is a single file or a directory.
+        kind: FileKind,
+        /// Guessed MIME type (empty for directories or when unknown).
+        mime: String,
     },
     /// A peer connected to us.
     PeerConnected,
@@ -49,6 +117,9 @@ pub enum SendEvent {
     Progress { sent: u64 },
     /// The data was completely transferred to a peer.
     Completed,
+    /// A transfer was in progress but the peer cancelled (or dropped the
+    /// connection) before completing it.
+    PeerCancelled,
     /// Something went wrong.
     Error(String),
 }
@@ -64,10 +135,35 @@ pub enum ReceiveEvent {
     Progress { current: u64, total: u64 },
     /// Download done, exporting to the target directory.
     Exporting,
+    /// One or more target files already exist; awaiting a user decision.
+    Conflict { targets: Vec<PathBuf> },
     /// Everything was saved to the target directory.
     Completed { target: PathBuf },
+    /// The user chose to keep the existing files; nothing was overwritten.
+    KeptExisting { target: PathBuf },
+    /// The sender cancelled the transfer (or dropped the connection) while the
+    /// download was in progress.
+    SenderCancelled,
     /// Something went wrong.
     Error(String),
+}
+
+/// User's decision when an incoming transfer would overwrite existing files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverwriteDecision {
+    /// Remove the existing files and save the incoming ones.
+    Overwrite,
+    /// Leave the existing files untouched; do not save the incoming ones.
+    KeepExisting,
+}
+
+/// Outcome of a receive, reported back to the caller so it can emit the
+/// appropriate terminal event after cleanup.
+enum ReceiveOutcome {
+    Saved,
+    KeptExisting,
+    /// The sender cancelled (or dropped) the connection mid-transfer.
+    SenderCancelled,
 }
 
 /// Parse a ticket from user input.
@@ -135,6 +231,14 @@ async fn send_file_inner(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+    // Collect metadata about the offered path so the receiver can show the
+    // kind and type of the incoming transfer before deciding to accept.
+    let kind = if path.is_dir() {
+        FileKind::Directory
+    } else {
+        FileKind::File
+    };
+    let mime = guess_mime(&path);
     let (temp_tag, size, _collection) = import(path, blobs.store(), &mut mp, None).await?;
     let hash = temp_tag.hash();
 
@@ -160,6 +264,8 @@ async fn send_file_inner(
             ticket: ticket.to_string(),
             name,
             size,
+            kind,
+            mime,
         })
         .await
         .ok();
@@ -233,6 +339,13 @@ async fn send_file_inner(
                             if c.completed >= 1 && c.aborted == 0 && c.completed == c.started {
                                 break true;
                             }
+                            // a transfer was in progress but did not finish:
+                            // the peer cancelled (or the connection dropped)
+                            // mid-transfer. inform the UI and stop waiting.
+                            if c.started > 0 {
+                                events.send(SendEvent::PeerCancelled).await.ok();
+                                break false;
+                            }
                         }
                     }
                     _ => {}
@@ -252,18 +365,41 @@ async fn send_file_inner(
     Ok(())
 }
 
+/// Returns true when an error chain indicates the peer deliberately closed
+/// the QUIC connection — the signature of the sender cancelling a transfer
+/// (as opposed to a transient network failure or a local error).
+///
+/// iroh/quice reports such a close as "... closed by peer: <code>" in the
+/// innermost error source, so we scan the whole [`anyhow::Error::chain`].
+fn is_peer_initiated_close(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.to_string().contains("closed by peer"))
+}
+
 /// Receive the data behind `ticket` and save it below `target_dir`.
+///
+/// If saving would overwrite existing files, a [`ReceiveEvent::Conflict`] is
+/// emitted and the future pauses until a decision arrives on `decision_rx`.
 pub async fn receive_ticket(
     ticket: BlobTicket,
     target_dir: PathBuf,
     events: mpsc::Sender<ReceiveEvent>,
+    decision_rx: oneshot::Receiver<OverwriteDecision>,
 ) {
-    match receive_ticket_inner(&ticket, &target_dir, events.clone()).await {
-        Ok(()) => {
+    match receive_ticket_inner(&ticket, &target_dir, events.clone(), decision_rx).await {
+        Ok(ReceiveOutcome::Saved) => {
             events
                 .send(ReceiveEvent::Completed { target: target_dir })
                 .await
                 .ok();
+        }
+        Ok(ReceiveOutcome::KeptExisting) => {
+            events
+                .send(ReceiveEvent::KeptExisting { target: target_dir })
+                .await
+                .ok();
+        }
+        Ok(ReceiveOutcome::SenderCancelled) => {
+            events.send(ReceiveEvent::SenderCancelled).await.ok();
         }
         Err(e) => {
             events
@@ -278,7 +414,8 @@ async fn receive_ticket_inner(
     ticket: &BlobTicket,
     target_dir: &Path,
     events: mpsc::Sender<ReceiveEvent>,
-) -> anyhow::Result<()> {
+    decision_rx: oneshot::Receiver<OverwriteDecision>,
+) -> anyhow::Result<ReceiveOutcome> {
     let addr = ticket.addr().clone();
     let secret_key = get_or_create_secret(false)?;
     let mut builder = Endpoint::builder(presets::N0)
@@ -293,12 +430,17 @@ async fn receive_ticket_inner(
     let iroh_data_dir =
         std::env::temp_dir().join(format!("sendme-balloon-recv-{}", ticket.hash().to_hex()));
     let db = FsStore::load(&iroh_data_dir).await?;
+    // Becomes true once we have established a connection to the sender. An
+    // error afterwards whose chain contains "closed by peer" is treated as a
+    // deliberate sender cancellation rather than a generic connection fault.
+    let mut connected = false;
     let res = async {
         let hash_and_format = ticket.hash_and_format();
         let local = db.remote().local(hash_and_format).await?;
         if !local.is_complete() {
             events.send(ReceiveEvent::Connecting).await.ok();
             let connection = endpoint.connect(addr, iroh_blobs::protocol::ALPN).await?;
+            connected = true;
             let (_hash_seq, sizes) =
                 get_hash_seq_and_sizes(&connection, &hash_and_format.hash, 1024 * 1024 * 32, None)
                     .await?;
@@ -333,14 +475,40 @@ async fn receive_ticket_inner(
             }
         }
         let collection = Collection::load(hash_and_format.hash, db.as_ref()).await?;
-        events.send(ReceiveEvent::Exporting).await.ok();
-        let mut mp = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
-        export(&db, collection, target_dir, &mut mp).await?;
-        anyhow::Ok(())
+        let conflicts = export_conflicts(&collection, target_dir)?;
+        if conflicts.is_empty() {
+            events.send(ReceiveEvent::Exporting).await.ok();
+            let mut mp = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+            export(&db, collection, target_dir, &mut mp, false).await?;
+            anyhow::Ok(ReceiveOutcome::Saved)
+        } else {
+            events
+                .send(ReceiveEvent::Conflict { targets: conflicts })
+                .await
+                .ok();
+            let decision = decision_rx.await.unwrap_or(OverwriteDecision::KeepExisting);
+            match decision {
+                OverwriteDecision::KeepExisting => anyhow::Ok(ReceiveOutcome::KeptExisting),
+                OverwriteDecision::Overwrite => {
+                    events.send(ReceiveEvent::Exporting).await.ok();
+                    let mut mp = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+                    export(&db, collection, target_dir, &mut mp, true).await?;
+                    anyhow::Ok(ReceiveOutcome::Saved)
+                }
+            }
+        }
     }
     .await;
     endpoint.close().await;
     db.shutdown().await.ok();
+    // A peer-initiated close after we connected means the sender cancelled
+    // the transfer. Translate that into a clear outcome instead of leaking a
+    // cryptic "connection lost: closed by peer" error to the user.
+    let res = match res {
+        Ok(outcome) => Ok(outcome),
+        Err(e) if connected && is_peer_initiated_close(&e) => Ok(ReceiveOutcome::SenderCancelled),
+        Err(e) => Err(e),
+    };
     if res.is_ok() {
         tokio::fs::remove_dir_all(&iroh_data_dir).await.ok();
     }
@@ -400,4 +568,33 @@ pub fn disable_autostart() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("removing {}: {e}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_initiated_close_detected_from_chain() {
+        // the innermost source carries the quic "closed by peer" message
+        let inner = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "closed by peer: 0");
+        let e = anyhow::Error::new(inner).context("read: connection lost");
+        assert!(is_peer_initiated_close(&e));
+    }
+
+    #[test]
+    fn peer_initiated_close_detected_when_top_level() {
+        let e = anyhow::anyhow!("connection lost: closed by peer: 0");
+        assert!(is_peer_initiated_close(&e));
+    }
+
+    #[test]
+    fn transient_error_not_classified_as_peer_close() {
+        let e = anyhow::anyhow!("operation timed out");
+        assert!(!is_peer_initiated_close(&e));
+
+        let inner = std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out");
+        let e = anyhow::Error::new(inner).context("connecting to sender");
+        assert!(!is_peer_initiated_close(&e));
+    }
 }

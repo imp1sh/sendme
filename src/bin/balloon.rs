@@ -32,11 +32,11 @@ use iroh::EndpointId;
 use iroh_blobs::ticket::BlobTicket;
 use sendme::balloon::{
     autostart_is_enabled, disable_autostart, enable_autostart, parse_ticket, receive_ticket,
-    send_file, ReceiveEvent, SendEvent,
+    send_file, FileKind, OverwriteDecision, ReceiveEvent, SendEvent,
 };
 use sendme::contacts::{
     create_contact_endpoint, load_or_create_secret, run_accept_loop, send_offer, AddressBook,
-    Contact, IncomingOffer,
+    Contact, IncomingOffer, OfferResult, TransferResult,
 };
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 #[cfg(target_os = "linux")]
@@ -48,14 +48,29 @@ use winit::platform::x11::EventLoopBuilderExtX11;
 /// block the egui UI thread.  Errors are silently discarded — if no
 /// notification daemon is running (e.g. bare i3/sway without mako/dunst),
 /// the balloon's own visual change is the fallback.
-fn notify_incoming_offer(from_short: &str, name: &str, size: u64) {
-    let from = from_short.to_string();
+///
+/// When `contact_name` is `Some`, the sender is a known contact and the
+/// notification names them; otherwise the sender is flagged as unknown so
+/// the user can judge the request before accepting.
+fn notify_incoming_offer(
+    contact_name: Option<&str>,
+    from_short: &str,
+    name: &str,
+    size: u64,
+    kind: FileKind,
+    mime: &str,
+) {
+    let contact_name = contact_name.map(|s| s.to_string());
+    let from_short = from_short.to_string();
     let name = name.to_string();
+    let type_label = type_label(kind, mime);
     std::thread::spawn(move || {
+        let who = match &contact_name {
+            Some(cn) => format!("your contact \"{cn}\""),
+            None => format!("an unknown sender ({from_short}) — not in your address book"),
+        };
         let body = format!(
-            "{} wants to send you: {} ({})",
-            from,
-            name,
+            "{who} wants to send you: {name} ({}, {type_label})",
             HumanBytes(size)
         );
         let _ = notify_rust::Notification::new()
@@ -64,6 +79,63 @@ fn notify_incoming_offer(from_short: &str, name: &str, size: u64) {
             .timeout(notify_rust::Timeout::Milliseconds(10000))
             .show();
     });
+}
+
+/// Render a compact, human-readable label for an offered transfer's type,
+/// e.g. "directory", "PDF (application/pdf)" or just "file".
+fn type_label(kind: FileKind, mime: &str) -> String {
+    match kind {
+        FileKind::Directory => "directory".to_string(),
+        FileKind::File => {
+            if mime.is_empty() || mime == "application/octet-stream" {
+                "file".to_string()
+            } else {
+                let friendly = friendly_type_name(mime);
+                match friendly {
+                    Some(f) => format!("{f} ({mime})"),
+                    None => mime.to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// Map a MIME type to a short, friendly name for display. Returns `None` when
+/// no friendly alias is known, in which case the raw MIME is shown.
+fn friendly_type_name(mime: &str) -> Option<&'static str> {
+    match mime {
+        "application/pdf" => Some("PDF"),
+        "image/png" => Some("PNG image"),
+        "image/jpeg" => Some("JPEG image"),
+        "image/gif" => Some("GIF image"),
+        "image/webp" => Some("WebP image"),
+        "image/svg+xml" => Some("SVG image"),
+        "text/plain" => Some("plain text"),
+        "text/html" => Some("HTML"),
+        "application/zip" => Some("ZIP archive"),
+        "application/x-tar" => Some("tar archive"),
+        "application/gzip" | "application/x-gzip" => Some("gzip archive"),
+        "application/x-7z-compressed" => Some("7z archive"),
+        "application/x-rar-compressed" => Some("RAR archive"),
+        "application/x-bzip2" => Some("bzip2 archive"),
+        "video/mp4" => Some("MP4 video"),
+        "video/x-matroska" => Some("Matroska video"),
+        "audio/mpeg" => Some("MP3 audio"),
+        "audio/ogg" => Some("Ogg audio"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            Some("Word document")
+        }
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            Some("Excel spreadsheet")
+        }
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
+            Some("PowerPoint presentation")
+        }
+        "application/json" => Some("JSON"),
+        "application/xml" | "text/xml" => Some("XML"),
+        "application/octet-stream" => Some("binary"),
+        _ => None,
+    }
 }
 
 /// Commands from the GUI to the background worker.
@@ -76,6 +148,8 @@ enum Command {
         ticket: String,
         name: String,
         size: u64,
+        kind: FileKind,
+        mime: String,
     },
     CancelSend,
     Receive {
@@ -84,8 +158,13 @@ enum Command {
     /// Begin receiving a ticket that arrived via an accepted offer.
     ReceiveOffer {
         ticket: String,
+        /// Used to report the transfer outcome back to the sender via the
+        /// offer stream. ``None`` for manual (non-offer) receives.
+        result_tx: Option<oneshot::Sender<TransferResult>>,
     },
     CancelReceive,
+    /// User decided whether to overwrite existing files during a receive.
+    ResolveConflict(OverwriteDecision),
 }
 
 /// Events from the background worker to the GUI.
@@ -105,8 +184,14 @@ enum UiEvent {
     NodeIdReady(String),
     /// A remote peer pushed a transfer ticket to us.
     OfferReceived(IncomingOffer),
-    /// The contact accepted our outgoing offer.
-    OfferAccepted,
+    /// The contact accepted our outgoing offer and saved the file(s).
+    OfferTransferSaved {
+        name: String,
+    },
+    /// The contact accepted but kept existing file(s); nothing was overwritten.
+    OfferKeptExisting {
+        name: String,
+    },
     /// The contact declined our outgoing offer.
     OfferRejected,
     /// Something went wrong with an outgoing offer (or the contact endpoint).
@@ -126,11 +211,15 @@ enum UiState {
         ticket: String,
         name: String,
         size: u64,
+        kind: FileKind,
+        mime: String,
         peer: bool,
         sent: u64,
     },
     /// The data was transferred to a peer.
     SendDone { name: String },
+    /// The peer received the data but kept existing file(s).
+    SendKept { name: String },
     /// Asking the user to paste a ticket.
     EnterTicket { error: Option<String> },
     /// The folder picker dialog is showing and the balloon is hidden.
@@ -143,6 +232,10 @@ enum UiState {
     },
     /// Download finished and saved.
     ReceiveDone { target: PathBuf },
+    /// A receive would overwrite existing files; asking the user.
+    ConfirmOverwrite { targets: Vec<PathBuf> },
+    /// The receive was skipped; the existing files were kept.
+    ReceiveKept { target: PathBuf },
     /// Something went wrong.
     Error { message: String },
     /// Browsing/managing the address book.
@@ -154,6 +247,8 @@ enum UiState {
         ticket: String,
         name: String,
         size: u64,
+        kind: FileKind,
+        mime: String,
         peer: bool,
         sent: u64,
     },
@@ -163,14 +258,24 @@ enum UiState {
         ticket: String,
         name: String,
         size: u64,
-        peer: bool,
+        kind: FileKind,
+        mime: String,
         sent: u64,
     },
     /// A remote peer wants to send us a file; awaiting an accept/decline.
+    ///
+    /// `contact_name` is `Some(name)` when the sender's node id matches a
+    /// contact in the address book, so the UI can flag the request as coming
+    /// from a known contact. It is `None` when the sender is unknown, in
+    /// which case the UI warns the user that the sender is not in the
+    /// address book.
     IncomingOffer {
         from_short: String,
+        contact_name: Option<String>,
         name: String,
         size: u64,
+        kind: FileKind,
+        mime: String,
         ticket: String,
     },
 }
@@ -180,6 +285,8 @@ const SEND_COLOR_HOVER: Color32 = Color32::from_rgb(108, 160, 247);
 const RECV_COLOR: Color32 = Color32::from_rgb(52, 168, 83);
 const RECV_COLOR_HOVER: Color32 = Color32::from_rgb(94, 190, 120);
 const BUBBLE_BG: Color32 = Color32::from_rgb(32, 33, 36);
+/// Amber used for cautionary highlights (e.g. an unknown sender).
+const AMBER: Color32 = Color32::from_rgb(230, 160, 30);
 const IDLE_SIZE: Vec2 = Vec2::new(164.0, 150.0);
 
 struct BalloonApp {
@@ -195,11 +302,19 @@ struct BalloonApp {
     /// oneshot used to report the user's accept/decline for the current
     /// incoming offer. Lives outside [`UiState`] so that state stays `Clone`.
     pending_offer_respond: Option<oneshot::Sender<bool>>,
+    /// oneshot used to report the transfer outcome back to the sender.
+    /// Taken when the user accepts an incoming offer and passed to the
+    /// worker via [`Command::ReceiveOffer`].
+    pending_offer_result: Option<oneshot::Sender<TransferResult>>,
     /// Text inputs for the add-contact form.
     add_contact_name: String,
     add_contact_node_id: String,
     /// Whether autostart-at-login is currently enabled (cached at startup).
     autostart_enabled: bool,
+    /// True while a contact-offer transfer is in progress. Suppresses the
+    /// blobs-protocol ``Completed`` signal so the offer result (which
+    /// distinguishes "saved" from "kept existing") is authoritative.
+    offer_in_progress: bool,
 }
 
 impl BalloonApp {
@@ -217,9 +332,11 @@ impl BalloonApp {
             node_id: String::new(),
             address_book: AddressBook::load().unwrap_or_default(),
             pending_offer_respond: None,
+            pending_offer_result: None,
             add_contact_name: String::new(),
             add_contact_node_id: String::new(),
             autostart_enabled: autostart_is_enabled(),
+            offer_in_progress: false,
         }
     }
 
@@ -241,13 +358,21 @@ impl BalloonApp {
             }
             UiEvent::Send(e) => match (e, &mut self.state) {
                 (
-                    SendEvent::TicketReady { ticket, name, size },
+                    SendEvent::TicketReady {
+                        ticket,
+                        name,
+                        size,
+                        kind,
+                        mime,
+                    },
                     UiState::Preparing { .. } | UiState::PickingFile,
                 ) => {
                     self.state = UiState::Waiting {
                         ticket,
                         name,
                         size,
+                        kind,
+                        mime,
                         peer: false,
                         sent: 0,
                     };
@@ -260,8 +385,20 @@ impl BalloonApp {
                     *s = sent;
                 }
                 (SendEvent::Completed, UiState::Waiting { name, .. }) => {
-                    let name = name.clone();
-                    self.state = UiState::SendDone { name };
+                    if !self.offer_in_progress {
+                        let name = name.clone();
+                        self.state = UiState::SendDone { name };
+                    }
+                }
+                (SendEvent::PeerCancelled, UiState::Waiting { name, .. }) => {
+                    // the offer flow reports the outcome separately (OfferError),
+                    // so only surface a manual-transfer cancellation here.
+                    if !self.offer_in_progress {
+                        let name = name.clone();
+                        self.state = UiState::Error {
+                            message: format!("the receiver cancelled the transfer of \"{name}\""),
+                        };
+                    }
                 }
                 (
                     SendEvent::Error(message),
@@ -284,6 +421,12 @@ impl BalloonApp {
                 (SendEvent::Error(message), UiState::PickContact { .. }) => {
                     self.state = UiState::Error { message };
                 }
+                (SendEvent::PeerCancelled, UiState::PickContact { name, .. }) => {
+                    let name = name.clone();
+                    self.state = UiState::Error {
+                        message: format!("the receiver cancelled the transfer of \"{name}\""),
+                    };
+                }
                 // while waiting for the contact's decision, a peer connecting
                 // means the transfer has started -> show normal progress
                 (
@@ -292,6 +435,8 @@ impl BalloonApp {
                         ticket,
                         name,
                         size,
+                        kind,
+                        mime,
                         sent,
                         ..
                     },
@@ -299,11 +444,15 @@ impl BalloonApp {
                     let ticket = ticket.clone();
                     let name = name.clone();
                     let size = *size;
+                    let kind = *kind;
+                    let mime = mime.clone();
                     let sent = *sent;
                     self.state = UiState::Waiting {
                         ticket,
                         name,
                         size,
+                        kind,
+                        mime,
                         peer: true,
                         sent,
                     };
@@ -311,25 +460,37 @@ impl BalloonApp {
                 (
                     SendEvent::Progress { sent },
                     UiState::OfferPending {
-                        ticket, name, size, ..
+                        ticket,
+                        name,
+                        size,
+                        kind,
+                        mime,
+                        ..
                     },
                 ) => {
                     let ticket = ticket.clone();
                     let name = name.clone();
                     let size = *size;
+                    let kind = *kind;
+                    let mime = mime.clone();
                     self.state = UiState::Waiting {
                         ticket,
                         name,
                         size,
+                        kind,
+                        mime,
                         peer: true,
                         sent,
                     };
                 }
                 (SendEvent::Completed, UiState::OfferPending { name, .. }) => {
-                    let name = name.clone();
-                    self.state = UiState::SendDone { name };
+                    if !self.offer_in_progress {
+                        let name = name.clone();
+                        self.state = UiState::SendDone { name };
+                    }
                 }
                 (SendEvent::Error(message), UiState::OfferPending { .. }) => {
+                    self.offer_in_progress = false;
                     self.state = UiState::Error { message };
                 }
                 _ => {}
@@ -389,8 +550,25 @@ impl BalloonApp {
                 (ReceiveEvent::Exporting, UiState::Receiving { status, .. }) => {
                     *status = "saving files ...".into();
                 }
+                (ReceiveEvent::Conflict { targets }, UiState::Receiving { .. }) => {
+                    self.state = UiState::ConfirmOverwrite { targets };
+                }
+                (
+                    ReceiveEvent::KeptExisting { target },
+                    UiState::ConfirmOverwrite { .. } | UiState::Receiving { .. },
+                ) => {
+                    self.state = UiState::ReceiveKept { target };
+                }
                 (ReceiveEvent::Completed { target }, UiState::Receiving { .. }) => {
                     self.state = UiState::ReceiveDone { target };
+                }
+                (
+                    ReceiveEvent::SenderCancelled,
+                    UiState::Receiving { .. } | UiState::PickingFolder,
+                ) => {
+                    self.state = UiState::Error {
+                        message: "the sender cancelled the transfer".into(),
+                    };
                 }
                 (
                     ReceiveEvent::Error(message),
@@ -405,12 +583,29 @@ impl BalloonApp {
             }
             UiEvent::OfferReceived(offer) => {
                 if matches!(self.state, UiState::Idle) {
-                    notify_incoming_offer(&offer.from_short, &offer.name, offer.size);
+                    // Resolve the sender against the address book so the UI
+                    // can tell known contacts apart from unknown senders.
+                    let contact_name = self
+                        .address_book
+                        .find_by_node_id(&offer.from)
+                        .map(|c| c.name.clone());
+                    notify_incoming_offer(
+                        contact_name.as_deref(),
+                        &offer.from_short,
+                        &offer.name,
+                        offer.size,
+                        offer.kind,
+                        &offer.mime,
+                    );
                     self.pending_offer_respond = Some(offer.respond);
+                    self.pending_offer_result = Some(offer.result_tx);
                     self.state = UiState::IncomingOffer {
                         from_short: offer.from_short,
+                        contact_name,
                         name: offer.name,
                         size: offer.size,
+                        kind: offer.kind,
+                        mime: offer.mime,
                         ticket: offer.ticket,
                     };
                 } else {
@@ -418,31 +613,26 @@ impl BalloonApp {
                     let _ = offer.respond.send(false);
                 }
             }
-            UiEvent::OfferAccepted => {
-                let next = if let UiState::OfferPending {
-                    ticket,
-                    name,
-                    size,
-                    peer,
-                    sent,
-                    ..
-                } = &self.state
-                {
-                    Some(UiState::Waiting {
-                        ticket: ticket.clone(),
-                        name: name.clone(),
-                        size: *size,
-                        peer: *peer,
-                        sent: *sent,
-                    })
-                } else {
-                    None
-                };
-                if let Some(s) = next {
-                    self.state = s;
+            UiEvent::OfferTransferSaved { name } => {
+                self.offer_in_progress = false;
+                if matches!(
+                    self.state,
+                    UiState::OfferPending { .. } | UiState::Waiting { .. }
+                ) {
+                    self.state = UiState::SendDone { name };
+                }
+            }
+            UiEvent::OfferKeptExisting { name } => {
+                self.offer_in_progress = false;
+                if matches!(
+                    self.state,
+                    UiState::OfferPending { .. } | UiState::Waiting { .. }
+                ) {
+                    self.state = UiState::SendKept { name };
                 }
             }
             UiEvent::OfferRejected => {
+                self.offer_in_progress = false;
                 if matches!(self.state, UiState::OfferPending { .. }) {
                     self.send_cmd(Command::CancelSend);
                     self.state = UiState::Error {
@@ -451,6 +641,7 @@ impl BalloonApp {
                 }
             }
             UiEvent::OfferError(message) => {
+                self.offer_in_progress = false;
                 if matches!(self.state, UiState::OfferPending { .. }) {
                     self.send_cmd(Command::CancelSend);
                     self.state = UiState::Error { message };
@@ -464,7 +655,9 @@ impl BalloonApp {
         // makes the accept loop treat it as a rejection.
         if matches!(self.state, UiState::IncomingOffer { .. }) {
             self.pending_offer_respond.take();
+            self.pending_offer_result.take();
         }
+        self.offer_in_progress = false;
         match &self.state {
             UiState::PickingFile
             | UiState::Preparing { .. }
@@ -474,6 +667,9 @@ impl BalloonApp {
             }
             UiState::PickingFolder | UiState::Receiving { .. } => {
                 self.send_cmd(Command::CancelReceive);
+            }
+            UiState::ConfirmOverwrite { .. } => {
+                self.send_cmd(Command::ResolveConflict(OverwriteDecision::KeepExisting));
             }
             _ => {}
         }
@@ -486,6 +682,7 @@ impl BalloonApp {
             UiState::AddressBook | UiState::AddContact { .. } | UiState::PickContact { .. } => {
                 Vec2::new(370.0, 320.0)
             }
+            UiState::IncomingOffer { .. } => Vec2::new(370.0, 290.0),
             _ => Vec2::new(370.0, 250.0),
         }
     }
@@ -732,11 +929,17 @@ impl BalloonApp {
                 ticket,
                 name,
                 size,
+                kind,
+                mime,
                 peer,
                 sent,
             } => {
                 self.title_bar(ui, ctx, "🎈 Send");
-                ui.label(format!("{name} ({})", HumanBytes(size)));
+                ui.label(format!(
+                    "{name} ({}, {type_label})",
+                    HumanBytes(size),
+                    type_label = type_label(kind, &mime)
+                ));
                 ui.add_space(4.0);
                 ui.label("Ticket for the other side:");
                 egui::ScrollArea::vertical()
@@ -787,6 +990,8 @@ impl BalloonApp {
                         ticket,
                         name,
                         size,
+                        kind,
+                        mime,
                         peer,
                         sent,
                     };
@@ -796,6 +1001,21 @@ impl BalloonApp {
                 self.title_bar(ui, ctx, "🎈 Send");
                 ui.add_space(8.0);
                 ui.colored_label(RECV_COLOR, format!("✓ \"{name}\" was transferred."));
+                ui.add_space(8.0);
+                if ui.button("OK").clicked() {
+                    self.state = UiState::Idle;
+                }
+            }
+            UiState::SendKept { name } => {
+                self.title_bar(ui, ctx, "🎈 Send");
+                ui.add_space(8.0);
+                ui.colored_label(
+                    Color32::from_rgb(230, 160, 30),
+                    format!(
+                        "\"{name}\" was received but the peer kept \
+                         existing file(s). Nothing was overwritten."
+                    ),
+                );
                 ui.add_space(8.0);
                 if ui.button("OK").clicked() {
                     self.state = UiState::Idle;
@@ -871,6 +1091,57 @@ impl BalloonApp {
                 self.title_bar(ui, ctx, "🎈 Receive");
                 ui.add_space(8.0);
                 ui.colored_label(RECV_COLOR, format!("✓ saved to {}", target.display()));
+                ui.add_space(8.0);
+                if ui.button("OK").clicked() {
+                    self.state = UiState::Idle;
+                }
+            }
+            UiState::ConfirmOverwrite { targets } => {
+                self.title_bar(ui, ctx, "🎈 Receive");
+                ui.label("A file with the same name already exists:");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(80.0)
+                    .show(ui, |ui| {
+                        for t in &targets {
+                            ui.label(
+                                RichText::new(t.display().to_string())
+                                    .monospace()
+                                    .size(11.0),
+                            );
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.label("Overwrite the existing file(s)?");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Overwrite").clicked() {
+                        self.send_cmd(Command::ResolveConflict(OverwriteDecision::Overwrite));
+                        self.state = UiState::Receiving {
+                            status: "overwriting …".into(),
+                            current: 0,
+                            total: 0,
+                        };
+                    }
+                    if ui.button("Keep existing").clicked() {
+                        self.send_cmd(Command::ResolveConflict(OverwriteDecision::KeepExisting));
+                        self.state = UiState::Receiving {
+                            status: "keeping existing …".into(),
+                            current: 0,
+                            total: 0,
+                        };
+                    }
+                });
+            }
+            UiState::ReceiveKept { target } => {
+                self.title_bar(ui, ctx, "🎈 Receive");
+                ui.add_space(8.0);
+                ui.colored_label(
+                    RECV_COLOR,
+                    "✓ kept the existing file(s), nothing was overwritten.",
+                );
+                ui.add_space(4.0);
+                ui.label(format!("save folder: {}", target.display()));
                 ui.add_space(8.0);
                 if ui.button("OK").clicked() {
                     self.state = UiState::Idle;
@@ -1010,13 +1281,16 @@ impl BalloonApp {
                 ticket,
                 name,
                 size,
+                kind,
+                mime,
                 peer,
                 sent,
             } => {
                 self.title_bar(ui, ctx, "📤 Send to");
                 ui.label(format!(
-                    "Choose a contact for \"{name}\" ({}):",
-                    HumanBytes(size)
+                    "Choose a contact for \"{name}\" ({}, {type_label}):",
+                    HumanBytes(size),
+                    type_label = type_label(kind, &mime)
                 ));
                 ui.add_space(6.0);
                 let mut chosen: Option<(EndpointId, String)> = None;
@@ -1046,13 +1320,17 @@ impl BalloonApp {
                         ticket: ticket.clone(),
                         name: name.clone(),
                         size,
+                        kind,
+                        mime: mime.clone(),
                     });
+                    self.offer_in_progress = true;
                     self.state = UiState::OfferPending {
                         contact_name,
                         ticket,
                         name,
                         size,
-                        peer,
+                        kind,
+                        mime,
                         sent,
                     };
                     return;
@@ -1062,6 +1340,8 @@ impl BalloonApp {
                         ticket,
                         name,
                         size,
+                        kind,
+                        mime,
                         peer,
                         sent,
                     };
@@ -1071,12 +1351,15 @@ impl BalloonApp {
                 contact_name,
                 name,
                 size,
+                kind,
+                mime,
                 ..
             } => {
                 self.title_bar(ui, ctx, "📤 Send");
                 ui.label(format!(
-                    "Asking {contact_name} to accept \"{name}\" ({})…",
-                    HumanBytes(size)
+                    "Asking {contact_name} to accept \"{name}\" ({}, {type_label})…",
+                    HumanBytes(size),
+                    type_label = type_label(kind, &mime)
                 ));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -1090,28 +1373,61 @@ impl BalloonApp {
             }
             UiState::IncomingOffer {
                 from_short,
+                contact_name,
                 name,
                 size,
+                kind,
+                mime,
                 ticket,
             } => {
                 self.title_bar(ui, ctx, "📥 Incoming transfer");
-                ui.label(format!("{from_short} wants to send you:"));
+                match &contact_name {
+                    Some(cn) => {
+                        ui.colored_label(
+                            RECV_COLOR,
+                            RichText::new(format!("📇 Known contact: \"{cn}\"")).strong(),
+                        );
+                    }
+                    None => {
+                        ui.colored_label(
+                            AMBER,
+                            RichText::new("⚠ Unknown sender — NOT in your address book").strong(),
+                        );
+                    }
+                }
+                ui.add_space(2.0);
+                ui.label(format!("node id: {from_short}"));
+                ui.add_space(2.0);
+                ui.label("wants to send you:");
                 ui.add_space(4.0);
-                ui.label(RichText::new(format!("\"{name}\"  ({})", HumanBytes(size))).strong());
+                ui.label(
+                    RichText::new(format!(
+                        "\"{name}\"  ({}, {type_label})",
+                        HumanBytes(size),
+                        type_label = type_label(kind, &mime)
+                    ))
+                    .strong(),
+                );
+                if contact_name.is_none() {
+                    ui.add_space(4.0);
+                    ui.colored_label(AMBER, "Only accept if you recognise this sender.");
+                }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("✔ Accept").clicked() {
                         if let Some(r) = self.pending_offer_respond.take() {
                             let _ = r.send(true);
                         }
+                        let result_tx = self.pending_offer_result.take();
                         self.state = UiState::PickingFolder;
                         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-                        self.send_cmd(Command::ReceiveOffer { ticket });
+                        self.send_cmd(Command::ReceiveOffer { ticket, result_tx });
                     }
                     if ui.button("✘ Decline").clicked() {
                         if let Some(r) = self.pending_offer_respond.take() {
                             let _ = r.send(false);
                         }
+                        self.pending_offer_result.take();
                         self.state = UiState::Idle;
                     }
                 });
@@ -1212,15 +1528,47 @@ fn start_receive(
     recv_task: &mut Option<tokio::task::JoinHandle<()>>,
     evt_tx: &std_mpsc::Sender<UiEvent>,
     ctx: &egui::Context,
+    decision_rx: oneshot::Receiver<OverwriteDecision>,
+    result_tx: Option<oneshot::Sender<TransferResult>>,
 ) {
     let _ = evt_tx.send(UiEvent::ReceiveStarting);
     ctx.request_repaint();
     let (re_tx, mut re_rx) = tokio_mpsc::channel(64);
-    *recv_task = Some(tokio::spawn(receive_ticket(ticket, dir, re_tx)));
+    *recv_task = Some(tokio::spawn(receive_ticket(
+        ticket,
+        dir,
+        re_tx,
+        decision_rx,
+    )));
     let evt_tx = evt_tx.clone();
     let ctx = ctx.clone();
     tokio::spawn(async move {
+        let mut result_tx = result_tx;
         while let Some(e) = re_rx.recv().await {
+            // Intercept the terminal receive events to report the outcome
+            // back to the sender (via the offer stream). Only sent once.
+            match &e {
+                ReceiveEvent::Completed { .. } => {
+                    if let Some(tx) = result_tx.take() {
+                        let _ = tx.send(TransferResult::Saved);
+                    }
+                }
+                ReceiveEvent::KeptExisting { .. } => {
+                    if let Some(tx) = result_tx.take() {
+                        let _ = tx.send(TransferResult::KeptExisting);
+                    }
+                }
+                ReceiveEvent::Error(_) => {
+                    // Dropping result_tx makes the accept loop send RESULT_ERROR.
+                    result_tx.take();
+                }
+                ReceiveEvent::SenderCancelled => {
+                    // The sender already gave up, but drop the channel so the
+                    // accept loop does not hang waiting for a result.
+                    result_tx.take();
+                }
+                _ => {}
+            }
             let _ = evt_tx.send(UiEvent::Receive(e));
             ctx.request_repaint();
         }
@@ -1278,6 +1626,9 @@ fn spawn_worker(
 
             let mut cancel_send: Option<oneshot::Sender<()>> = None;
             let mut recv_task: Option<tokio::task::JoinHandle<()>> = None;
+            // Sender used to deliver the user's overwrite decision to a paused
+            // receive task. Filled when a receive starts, drained on resolve.
+            let mut conflict_respond: Option<oneshot::Sender<OverwriteDecision>> = None;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     Command::PickAndSend => {
@@ -1304,17 +1655,28 @@ fn spawn_worker(
                         ticket,
                         name,
                         size,
+                        kind,
+                        mime,
                     } => match &contact_ep {
                         Some(ep) => {
                             let ep = ep.clone();
                             let evt_tx2 = evt_tx.clone();
                             let ctx2 = ctx.clone();
                             tokio::spawn(async move {
-                                let evt = match send_offer(&ep, node_id, ticket, name, size).await {
-                                    Ok(true) => UiEvent::OfferAccepted,
-                                    Ok(false) => UiEvent::OfferRejected,
-                                    Err(e) => UiEvent::OfferError(format!("{e:#}")),
-                                };
+                                let name_for_evt = name.clone();
+                                let evt =
+                                    match send_offer(&ep, node_id, ticket, name, size, kind, mime)
+                                        .await
+                                    {
+                                        Ok(OfferResult::Saved) => {
+                                            UiEvent::OfferTransferSaved { name: name_for_evt }
+                                        }
+                                        Ok(OfferResult::KeptExisting) => {
+                                            UiEvent::OfferKeptExisting { name: name_for_evt }
+                                        }
+                                        Ok(OfferResult::Declined) => UiEvent::OfferRejected,
+                                        Err(e) => UiEvent::OfferError(format!("{e:#}")),
+                                    };
                                 let _ = evt_tx2.send(evt);
                                 ctx2.request_repaint();
                             });
@@ -1339,17 +1701,23 @@ fn spawn_worker(
                             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                             match dir {
                                 None => emit(UiEvent::FolderPickCancelled),
-                                Some(dir) => start_receive(
-                                    ticket,
-                                    dir.path().to_path_buf(),
-                                    &mut recv_task,
-                                    &evt_tx,
-                                    &ctx,
-                                ),
+                                Some(dir) => {
+                                    let (dc_tx, dc_rx) = oneshot::channel();
+                                    conflict_respond = Some(dc_tx);
+                                    start_receive(
+                                        ticket,
+                                        dir.path().to_path_buf(),
+                                        &mut recv_task,
+                                        &evt_tx,
+                                        &ctx,
+                                        dc_rx,
+                                        None,
+                                    );
+                                }
                             }
                         }
                     },
-                    Command::ReceiveOffer { ticket } => match parse_ticket(&ticket) {
+                    Command::ReceiveOffer { ticket, result_tx } => match parse_ticket(&ticket) {
                         Err(e) => {
                             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                             emit(UiEvent::TicketInvalid(e.to_string()));
@@ -1362,19 +1730,30 @@ fn spawn_worker(
                             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                             match dir {
                                 None => emit(UiEvent::OfferFolderCancelled),
-                                Some(dir) => start_receive(
-                                    ticket,
-                                    dir.path().to_path_buf(),
-                                    &mut recv_task,
-                                    &evt_tx,
-                                    &ctx,
-                                ),
+                                Some(dir) => {
+                                    let (dc_tx, dc_rx) = oneshot::channel();
+                                    conflict_respond = Some(dc_tx);
+                                    start_receive(
+                                        ticket,
+                                        dir.path().to_path_buf(),
+                                        &mut recv_task,
+                                        &evt_tx,
+                                        &ctx,
+                                        dc_rx,
+                                        result_tx,
+                                    );
+                                }
                             }
                         }
                     },
                     Command::CancelReceive => {
                         if let Some(task) = recv_task.take() {
                             task.abort();
+                        }
+                    }
+                    Command::ResolveConflict(decision) => {
+                        if let Some(tx) = conflict_respond.take() {
+                            let _ = tx.send(decision);
                         }
                     }
                 }
@@ -1434,9 +1813,11 @@ mod tests {
                 node_id: String::new(),
                 address_book: AddressBook::default(),
                 pending_offer_respond: None,
+                pending_offer_result: None,
                 add_contact_name: String::new(),
                 add_contact_node_id: String::new(),
                 autostart_enabled: false,
+                offer_in_progress: false,
             },
             cmd_rx,
         )
@@ -1459,6 +1840,8 @@ mod tests {
             ticket: "ticket".into(),
             name: "example.txt".into(),
             size: 10,
+            kind: FileKind::File,
+            mime: "text/plain".into(),
             peer: false,
             sent: 0,
         });
@@ -1498,22 +1881,54 @@ mod tests {
     }
 
     #[test]
+    fn type_label_for_directory() {
+        assert_eq!(type_label(FileKind::Directory, ""), "directory");
+        // mime is ignored for directories
+        assert_eq!(
+            type_label(FileKind::Directory, "application/pdf"),
+            "directory"
+        );
+    }
+
+    #[test]
+    fn type_label_for_known_mime_is_friendly_plus_raw() {
+        let label = type_label(FileKind::File, "application/pdf");
+        assert!(label.contains("PDF"), "label was: {label}");
+        assert!(label.contains("application/pdf"), "label was: {label}");
+    }
+
+    #[test]
+    fn type_label_for_unknown_mime_falls_back_to_file() {
+        assert_eq!(type_label(FileKind::File, ""), "file");
+        assert_eq!(
+            type_label(FileKind::File, "application/octet-stream"),
+            "file"
+        );
+    }
+
+    #[test]
     fn incoming_offer_while_busy_is_declined() {
         let (mut app, _cmds) = app_in_state(UiState::Waiting {
             ticket: "t".into(),
             name: "n".into(),
             size: 1,
+            kind: FileKind::File,
+            mime: "".into(),
             peer: false,
             sent: 0,
         });
         let (tx, rx) = oneshot::channel();
+        let (rtx, _rrx) = oneshot::channel();
         let offer = IncomingOffer {
             from: "f".into(),
             from_short: "f".into(),
             name: "n".into(),
             size: 1,
+            kind: FileKind::File,
+            mime: "".into(),
             ticket: "t".into(),
             respond: tx,
+            result_tx: rtx,
         };
         app.apply(UiEvent::OfferReceived(offer));
         // busy -> declined, state unchanged
@@ -1525,13 +1940,17 @@ mod tests {
     fn incoming_offer_when_idle_prompts_user() {
         let (mut app, _cmds) = app_in_state(UiState::Idle);
         let (tx, rx) = oneshot::channel();
+        let (rtx, _rrx) = oneshot::channel();
         let offer = IncomingOffer {
             from: "f".into(),
             from_short: "f".into(),
             name: "pic.png".into(),
             size: 42,
+            kind: FileKind::File,
+            mime: "image/png".into(),
             ticket: "tk".into(),
             respond: tx,
+            result_tx: rtx,
         };
         app.apply(UiEvent::OfferReceived(offer));
         assert!(matches!(app.state, UiState::IncomingOffer { .. }));
@@ -1539,5 +1958,90 @@ mod tests {
         app.close_operation();
         assert!(matches!(app.state, UiState::Idle));
         assert!(rx.blocking_recv().is_err());
+    }
+
+    #[test]
+    fn peer_cancelled_shows_speaking_error_in_waiting() {
+        let (mut app, _cmds) = app_in_state(UiState::Waiting {
+            ticket: "t".into(),
+            name: "report.pdf".into(),
+            size: 1024,
+            kind: FileKind::File,
+            mime: "application/pdf".into(),
+            peer: true,
+            sent: 512,
+        });
+        app.offer_in_progress = false;
+        app.apply(UiEvent::Send(SendEvent::PeerCancelled));
+        match &app.state {
+            UiState::Error { message } => {
+                assert!(message.contains("cancelled"), "message was: {message}");
+                assert!(message.contains("report.pdf"), "message was: {message}");
+            }
+            _ => panic!("expected Error state after peer cancellation"),
+        }
+    }
+
+    #[test]
+    fn peer_cancelled_suppressed_during_offer_flow() {
+        let (mut app, _cmds) = app_in_state(UiState::Waiting {
+            ticket: "t".into(),
+            name: "report.pdf".into(),
+            size: 1024,
+            kind: FileKind::File,
+            mime: "application/pdf".into(),
+            peer: true,
+            sent: 512,
+        });
+        app.offer_in_progress = true;
+        app.apply(UiEvent::Send(SendEvent::PeerCancelled));
+        // suppressed — the offer flow reports the outcome separately
+        assert!(matches!(app.state, UiState::Waiting { .. }));
+    }
+
+    #[test]
+    fn peer_cancelled_in_pick_contact_shows_error() {
+        let (mut app, _cmds) = app_in_state(UiState::PickContact {
+            ticket: "t".into(),
+            name: "photo.png".into(),
+            size: 2048,
+            kind: FileKind::File,
+            mime: "image/png".into(),
+            peer: true,
+            sent: 10,
+        });
+        app.apply(UiEvent::Send(SendEvent::PeerCancelled));
+        match &app.state {
+            UiState::Error { message } => {
+                assert!(message.contains("cancelled"), "message was: {message}");
+                assert!(message.contains("photo.png"), "message was: {message}");
+            }
+            _ => panic!("expected Error state after peer cancellation"),
+        }
+    }
+
+    #[test]
+    fn sender_cancelled_shows_speaking_error_while_receiving() {
+        let (mut app, _cmds) = app_in_state(UiState::Receiving {
+            status: "downloading ...".into(),
+            current: 100,
+            total: 1000,
+        });
+        app.apply(UiEvent::Receive(ReceiveEvent::SenderCancelled));
+        match &app.state {
+            UiState::Error { message } => {
+                assert!(message.contains("sender"), "message was: {message}");
+                assert!(message.contains("cancelled"), "message was: {message}");
+            }
+            _ => panic!("expected Error state after sender cancellation"),
+        }
+    }
+
+    #[test]
+    fn sender_cancelled_ignored_outside_receiving() {
+        // arriving in an unrelated state must not clobber it
+        let (mut app, _cmds) = app_in_state(UiState::Idle);
+        app.apply(UiEvent::Receive(ReceiveEvent::SenderCancelled));
+        assert!(matches!(app.state, UiState::Idle));
     }
 }

@@ -24,21 +24,56 @@ use iroh::{endpoint::presets, Endpoint, EndpointId, RelayMode, SecretKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::balloon::FileKind;
+
 /// ALPN used to exchange transfer-ticket offers between two balloons.
 pub const OFFER_ALPN: &[u8] = b"sendme-balloon/offer/1";
 
 /// Wire-format version for the ticket-offer frame.
-const OFFER_VERSION: u8 = 1;
+///
+/// Version 1 carried only `ticket`, `name` and `size`. Version 2 adds the
+/// file `kind` (file/directory) and a `mime` type string so the receiver can
+/// show what kind of data is being offered before accepting. Version 1 frames
+/// are still accepted by [`decode_offer`] for backward compatibility.
+const OFFER_VERSION: u8 = 2;
 /// Ack byte values exchanged after an offer.
 const ACK_ACCEPT: u8 = 1;
 const ACK_REJECT: u8 = 0;
+/// Result byte values sent by the receiver after the transfer completes.
+/// Only sent following an ``ACK_ACCEPT``; the stream stays open (with
+/// heartbeats) until the receiver knows the outcome.
+const RESULT_SAVED: u8 = 3;
+const RESULT_KEPT_EXISTING: u8 = 4;
+const RESULT_ERROR: u8 = 5;
 /// Heartbeat byte sent periodically by the receiver while the remote user is
-/// still deciding whether to accept. Any data on the stream resets the QUIC
-/// idle timer on both sides, so this keeps the connection alive across what
-/// may be a multi-minute human pause.
+/// still deciding whether to accept, or while a transfer is in progress. Any
+/// data on the stream resets the QUIC idle timer on both sides, so this keeps
+/// the connection alive across what may be a multi-minute human pause.
 const HEARTBEAT_BYTE: u8 = 0xFE;
 /// How often the receiver sends a heartbeat while waiting for the user.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The outcome of an outgoing offer, reported by the receiver after the
+/// transfer attempt finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferResult {
+    /// The contact declined the transfer.
+    Declined,
+    /// The contact accepted and the file(s) were saved.
+    Saved,
+    /// The contact accepted but kept existing file(s); nothing was overwritten.
+    KeptExisting,
+}
+
+/// The outcome of a receive, sent back to the offering peer via the contact
+/// endpoint so the sender knows whether its file was saved or rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferResult {
+    /// The file(s) were saved to disk.
+    Saved,
+    /// The user chose to keep existing file(s); nothing was overwritten.
+    KeptExisting,
+}
 
 /// A contact: a friendly name and the peer's 256-bit [`EndpointId`].
 ///
@@ -96,6 +131,25 @@ impl AddressBook {
         let before = self.contacts.len();
         self.contacts.retain(|c| c.node_id != node_id);
         self.contacts.len() != before
+    }
+
+    /// Find a contact whose node id matches the given canonical node id
+    /// string (as produced by [`EndpointId::to_string`]).
+    ///
+    /// Both sides are parsed to [`EndpointId`] before comparing, so the
+    /// lookup is robust to minor formatting differences in the stored text.
+    /// Returns `None` if `node_id` is not a valid [`EndpointId`] or if no
+    /// contact matches.
+    pub fn find_by_node_id(&self, node_id: &str) -> Option<&Contact> {
+        let target = match node_id.parse::<EndpointId>() {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        self.contacts.iter().find(|c| {
+            c.node_id
+                .parse::<EndpointId>()
+                .is_ok_and(|cid| cid == target)
+        })
     }
 }
 
@@ -169,6 +223,8 @@ pub async fn create_contact_endpoint(secret: SecretKey) -> anyhow::Result<Endpoi
 
 /// A ticket offered by a remote peer, handed to the GUI for an accept/decline
 /// decision. `respond` carries the user's answer back to the network task.
+/// `result_tx` is used (only when accepted) to report the transfer outcome
+/// back to the sender over the same offer stream.
 #[derive(Debug)]
 pub struct IncomingOffer {
     /// Canonical string form of the sender's [`EndpointId`].
@@ -179,38 +235,66 @@ pub struct IncomingOffer {
     pub name: String,
     /// Total payload size in bytes.
     pub size: u64,
+    /// Whether the offered path is a single file or a directory.
+    pub kind: FileKind,
+    /// Guessed MIME type (empty for directories or when unknown).
+    pub mime: String,
     /// The transfer ticket the receiver should fetch from.
     pub ticket: String,
     /// Channel to report the user's accept (true) / decline (false) decision.
     pub respond: oneshot::Sender<bool>,
+    /// Channel to report the transfer outcome (only used when accepted).
+    /// Dropped without sending if the user declines.
+    pub result_tx: oneshot::Sender<TransferResult>,
+}
+
+/// A decoded ticket offer.
+///
+/// Returned by [`decode_offer`]; the fields are spread into [`IncomingOffer`]
+/// by the accept loop.
+pub struct DecodedOffer {
+    pub ticket: String,
+    pub name: String,
+    pub size: u64,
+    pub kind: FileKind,
+    pub mime: String,
 }
 
 /// Encode a ticket offer into a single byte buffer for transmission.
 ///
-/// Layout: `[version:u8][ticket_len:u32 BE][ticket][name_len:u32 BE][name][size:u64 BE]`.
-pub fn encode_offer(ticket: &str, name: &str, size: u64) -> Vec<u8> {
+/// Layout (version 2):
+/// `[version:u8][ticket_len:u32 BE][ticket][name_len:u32 BE][name][size:u64 BE][kind:u8][mime_len:u32 BE][mime]`
+pub fn encode_offer(ticket: &str, name: &str, size: u64, kind: FileKind, mime: &str) -> Vec<u8> {
     let ticket = ticket.as_bytes();
     let name = name.as_bytes();
-    let mut buf = Vec::with_capacity(1 + 4 + ticket.len() + 4 + name.len() + 8);
+    let mime = mime.as_bytes();
+    let mut buf =
+        Vec::with_capacity(1 + 4 + ticket.len() + 4 + name.len() + 8 + 1 + 4 + mime.len());
     buf.push(OFFER_VERSION);
     buf.extend(&(ticket.len() as u32).to_be_bytes());
     buf.extend_from_slice(ticket);
     buf.extend(&(name.len() as u32).to_be_bytes());
     buf.extend_from_slice(name);
     buf.extend(&size.to_be_bytes());
+    buf.push(kind.to_byte());
+    buf.extend(&(mime.len() as u32).to_be_bytes());
+    buf.extend_from_slice(mime);
     buf
 }
 
 /// Decode a ticket offer from a received byte buffer.
-pub fn decode_offer(buf: &[u8]) -> anyhow::Result<(String, String, u64)> {
-    if buf.len() < 1 + 4 + 8 {
+///
+/// Accepts both version 1 frames (no kind/mime fields) and version 2 frames.
+/// Version 1 frames yield [`FileKind::File`] and an empty MIME string.
+pub fn decode_offer(buf: &[u8]) -> anyhow::Result<DecodedOffer> {
+    if buf.is_empty() {
         anyhow::bail!("offer frame too short");
     }
     let mut i = 0;
     let version = buf[i];
     i += 1;
-    if version != OFFER_VERSION {
-        anyhow::bail!("unsupported offer version {version}");
+    if i + 4 > buf.len() {
+        anyhow::bail!("offer frame truncated (header)");
     }
     let ticket_len = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
     i += 4;
@@ -231,23 +315,59 @@ pub fn decode_offer(buf: &[u8]) -> anyhow::Result<(String, String, u64)> {
         .to_string();
     i += name_len;
     let size = u64::from_be_bytes(buf[i..i + 8].try_into().unwrap());
-    Ok((ticket, name, size))
+    i += 8;
+    let (kind, mime) = match version {
+        OFFER_VERSION => {
+            // version 2: kind byte + mime string
+            if i + 1 + 4 > buf.len() {
+                anyhow::bail!("offer frame truncated (kind/mime header)");
+            }
+            let kind = FileKind::from_byte(buf[i])?;
+            i += 1;
+            let mime_len = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            if i + mime_len > buf.len() {
+                anyhow::bail!("offer frame truncated (mime)");
+            }
+            let mime = std::str::from_utf8(&buf[i..i + mime_len])
+                .context("mime is not valid utf-8")?
+                .to_string();
+            (kind, mime)
+        }
+        1 => {
+            // legacy version 1: no kind/mime fields
+            (FileKind::File, String::new())
+        }
+        other => anyhow::bail!("unsupported offer version {other}"),
+    };
+    Ok(DecodedOffer {
+        ticket,
+        name,
+        size,
+        kind,
+        mime,
+    })
 }
 
 /// Send a ticket offer to `node_id` and wait for the peer's accept/decline
-/// answer. Returns `Ok(true)` on accept, `Ok(false)` on decline.
+/// answer, then (if accepted) for the transfer result.
+///
+/// Returns [`OfferResult::Declined`] if the peer declines, or
+/// [`OfferResult::Saved`] / [`OfferResult::KeptExisting`] once the receiver
+/// reports the outcome of the transfer.
 ///
 /// The peer sends periodic [`HEARTBEAT_BYTE`]s while its user is still
-/// deciding; those are skipped here so we only return on the final verdict.
-/// The heartbeats keep the QUIC connection alive across what may be a
-/// multi-minute human pause.
+/// deciding and while the transfer is in progress; those are skipped here so
+/// we only return on the final verdict and result.
 pub async fn send_offer(
     endpoint: &Endpoint,
     node_id: EndpointId,
     ticket: String,
     name: String,
     size: u64,
-) -> anyhow::Result<bool> {
+    kind: FileKind,
+    mime: String,
+) -> anyhow::Result<OfferResult> {
     let conn = endpoint
         .connect(node_id, OFFER_ALPN)
         .await
@@ -256,12 +376,13 @@ pub async fn send_offer(
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("opening stream: {e}"))?;
-    let frame = encode_offer(&ticket, &name, size);
+    let frame = encode_offer(&ticket, &name, size, kind, &mime);
     send.write_all(&frame)
         .await
         .map_err(|e| anyhow::anyhow!("sending offer: {e}"))?;
     send.finish()
         .map_err(|e| anyhow::anyhow!("finishing send stream: {e}"))?;
+    // Phase 1 — wait for the accept/decline ack (skipping heartbeats).
     loop {
         let mut byte = [0u8; 1];
         recv.read_exact(&mut byte)
@@ -269,9 +390,23 @@ pub async fn send_offer(
             .map_err(|e| anyhow::anyhow!("reading reply: {e}"))?;
         match byte[0] {
             HEARTBEAT_BYTE => continue,
-            ACK_ACCEPT => return Ok(true),
-            ACK_REJECT => return Ok(false),
+            ACK_ACCEPT => break, // accepted — proceed to phase 2
+            ACK_REJECT => return Ok(OfferResult::Declined),
             other => anyhow::bail!("unexpected reply byte: 0x{other:02x}"),
+        }
+    }
+    // Phase 2 — wait for the transfer result (skipping heartbeats).
+    loop {
+        let mut byte = [0u8; 1];
+        recv.read_exact(&mut byte)
+            .await
+            .map_err(|e| anyhow::anyhow!("reading transfer result: {e}"))?;
+        match byte[0] {
+            HEARTBEAT_BYTE => continue,
+            RESULT_SAVED => return Ok(OfferResult::Saved),
+            RESULT_KEPT_EXISTING => return Ok(OfferResult::KeptExisting),
+            RESULT_ERROR => anyhow::bail!("transfer failed on the receiver side"),
+            other => anyhow::bail!("unexpected result byte: 0x{other:02x}"),
         }
     }
 }
@@ -322,7 +457,7 @@ pub async fn run_accept_loop(endpoint: Endpoint, offer_tx: mpsc::Sender<Incoming
                     return;
                 }
             };
-            let (ticket, name, size) = match decode_offer(&buf) {
+            let decoded = match decode_offer(&buf) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("decoding offer failed: {e}");
@@ -330,13 +465,17 @@ pub async fn run_accept_loop(endpoint: Endpoint, offer_tx: mpsc::Sender<Incoming
                 }
             };
             let (resp_tx, mut resp_rx) = oneshot::channel();
+            let (result_tx, mut result_rx) = oneshot::channel();
             let offer = IncomingOffer {
                 from: from_full,
                 from_short,
-                name,
-                size,
-                ticket,
+                name: decoded.name,
+                size: decoded.size,
+                kind: decoded.kind,
+                mime: decoded.mime,
+                ticket: decoded.ticket,
                 respond: resp_tx,
+                result_tx,
             };
             if offer_tx.send(offer).await.is_err() {
                 // GUI gone: decline so the sender does not hang.
@@ -348,18 +487,44 @@ pub async fn run_accept_loop(endpoint: Endpoint, offer_tx: mpsc::Sender<Incoming
             // these bytes and waits for the final accept/decline. Periodic
             // data on the stream resets the QUIC idle timer on both sides,
             // keeping the connection alive across a multi-minute human pause.
-            loop {
+            let accepted = loop {
                 tokio::select! {
                     _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
                         if send.write_all(&[HEARTBEAT_BYTE]).await.is_err() {
-                            break;
+                            break false;
                         }
                     }
                     accepted = &mut resp_rx => {
-                        let ack = if accepted.unwrap_or(false) { ACK_ACCEPT } else { ACK_REJECT };
+                        let is_accepted = accepted.unwrap_or(false);
+                        let ack = if is_accepted { ACK_ACCEPT } else { ACK_REJECT };
                         let _ = send.write_all(&[ack]).await;
-                        let _ = send.finish();
-                        break;
+                        if !is_accepted {
+                            let _ = send.finish();
+                        }
+                        break is_accepted;
+                    }
+                }
+            };
+            // Phase 2 — if accepted, keep the stream open with heartbeats
+            // until the transfer result is known, then send the result byte.
+            if accepted {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
+                            if send.write_all(&[HEARTBEAT_BYTE]).await.is_err() {
+                                break;
+                            }
+                        }
+                        result = &mut result_rx => {
+                            let result_byte = match result {
+                                Ok(TransferResult::Saved) => RESULT_SAVED,
+                                Ok(TransferResult::KeptExisting) => RESULT_KEPT_EXISTING,
+                                Err(_) => RESULT_ERROR,
+                            };
+                            let _ = send.write_all(&[result_byte]).await;
+                            let _ = send.finish();
+                            break;
+                        }
                     }
                 }
             }
@@ -390,11 +555,22 @@ mod tests {
         let ticket = "abc123def456";
         let name = "photos/cat.png";
         let size = 4096u64;
-        let encoded = encode_offer(ticket, name, size);
-        let (t, n, s) = decode_offer(&encoded).unwrap();
-        assert_eq!(t, ticket);
-        assert_eq!(n, name);
-        assert_eq!(s, size);
+        let encoded = encode_offer(ticket, name, size, FileKind::File, "image/png");
+        let d = decode_offer(&encoded).unwrap();
+        assert_eq!(d.ticket, ticket);
+        assert_eq!(d.name, name);
+        assert_eq!(d.size, size);
+        assert_eq!(d.kind, FileKind::File);
+        assert_eq!(d.mime, "image/png");
+    }
+
+    #[test]
+    fn offer_directory_roundtrip() {
+        let encoded = encode_offer("t", "photos", 1024, FileKind::Directory, "");
+        let d = decode_offer(&encoded).unwrap();
+        assert_eq!(d.kind, FileKind::Directory);
+        assert_eq!(d.mime, "");
+        assert_eq!(d.name, "photos");
     }
 
     #[test]
@@ -402,16 +578,41 @@ mod tests {
         let ticket = "tkt";
         let name = "Résumé 📄.pdf";
         let size = 1u64;
-        let encoded = encode_offer(ticket, name, size);
-        let (t, n, s) = decode_offer(&encoded).unwrap();
-        assert_eq!(t, ticket);
-        assert_eq!(n, name);
-        assert_eq!(s, size);
+        let encoded = encode_offer(ticket, name, size, FileKind::File, "application/pdf");
+        let d = decode_offer(&encoded).unwrap();
+        assert_eq!(d.ticket, ticket);
+        assert_eq!(d.name, name);
+        assert_eq!(d.size, size);
+        assert_eq!(d.mime, "application/pdf");
+    }
+
+    #[test]
+    fn decode_accepts_legacy_v1_frame() {
+        // Hand-build a version 1 frame (no kind/mime fields) and ensure it
+        // decodes with the documented defaults.
+        let ticket = "abc";
+        let name = "report.pdf";
+        let size = 7u64;
+        let tb = ticket.as_bytes();
+        let nb = name.as_bytes();
+        let mut buf = Vec::with_capacity(1 + 4 + tb.len() + 4 + nb.len() + 8);
+        buf.push(1u8); // legacy version
+        buf.extend(&(tb.len() as u32).to_be_bytes());
+        buf.extend_from_slice(tb);
+        buf.extend(&(nb.len() as u32).to_be_bytes());
+        buf.extend_from_slice(nb);
+        buf.extend(&size.to_be_bytes());
+        let d = decode_offer(&buf).unwrap();
+        assert_eq!(d.ticket, ticket);
+        assert_eq!(d.name, name);
+        assert_eq!(d.size, size);
+        assert_eq!(d.kind, FileKind::File);
+        assert_eq!(d.mime, "");
     }
 
     #[test]
     fn decode_rejects_bad_version() {
-        let mut encoded = encode_offer("t", "n", 0);
+        let mut encoded = encode_offer("t", "n", 0, FileKind::File, "");
         encoded[0] = 99;
         assert!(decode_offer(&encoded).is_err());
     }
@@ -419,7 +620,7 @@ mod tests {
     #[test]
     fn decode_rejects_truncated() {
         assert!(decode_offer(&[]).is_err());
-        assert!(decode_offer(&[1]).is_err());
+        assert!(decode_offer(&[2]).is_err());
     }
 
     #[test]
@@ -440,5 +641,31 @@ mod tests {
         assert!(!book.remove("zzz"));
         assert_eq!(book.contacts.len(), 1);
         assert_eq!(book.contacts[0].name, "alice");
+    }
+
+    #[test]
+    fn find_by_node_id_matches_known_contact() {
+        // generate a real key pair so the node id is a valid EndpointId
+        let key = SecretKey::generate();
+        let id = key.public();
+        let id_str = id.to_string();
+        let book = AddressBook {
+            contacts: vec![
+                Contact {
+                    name: "alice".into(),
+                    node_id: id_str.clone(),
+                },
+                Contact {
+                    name: "bob".into(),
+                    node_id: "bbb".into(),
+                },
+            ],
+        };
+        // lookup by the canonical string form succeeds and resolves the name
+        assert_eq!(book.find_by_node_id(&id_str).unwrap().name, "alice");
+        // a bogus node id does not match anything and does not panic
+        assert!(book.find_by_node_id("not-a-real-node-id").is_none());
+        // bob's stored node id is not a valid EndpointId, so it can't match
+        assert!(book.find_by_node_id("bbb").is_none());
     }
 }

@@ -486,11 +486,28 @@ fn get_export_path(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// Compute the target paths a collection would export to below `root`, and
+/// return those that already exist (potential conflicts).
+pub(crate) fn export_conflicts(
+    collection: &Collection,
+    root: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut conflicts = Vec::new();
+    for (name, _) in collection.iter() {
+        let target = get_export_path(root, name)?;
+        if target.exists() {
+            conflicts.push(target);
+        }
+    }
+    Ok(conflicts)
+}
+
 async fn export(
     db: &Store,
     collection: Collection,
     root: &Path,
     mp: &mut MultiProgress,
+    overwrite: bool,
 ) -> anyhow::Result<()> {
     let op = mp.add(make_export_overall_progress());
     op.set_length(collection.len() as u64);
@@ -498,14 +515,22 @@ async fn export(
         op.set_position(i as u64);
         let target = get_export_path(root, name)?;
         if target.exists() {
-            eprintln!(
-                "target {} already exists. Export stopped.",
-                target.display()
-            );
-            eprintln!(
-                "You can remove the file or directory and try again. The download will not be repeated."
-            );
-            anyhow::bail!("target {} already exists", target.display());
+            if overwrite {
+                if target.is_dir() {
+                    tokio::fs::remove_dir_all(&target).await?;
+                } else {
+                    tokio::fs::remove_file(&target).await?;
+                }
+            } else {
+                eprintln!(
+                    "target {} already exists. Export stopped.",
+                    target.display()
+                );
+                eprintln!(
+                    "You can remove the file or directory and try again. The download will not be repeated."
+                );
+                anyhow::bail!("target {} already exists", target.display());
+            }
         }
         let mut stream = db
             .export_with_opts(ExportOptions {
@@ -1122,7 +1147,7 @@ pub async fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
                 println!("exporting to {first}");
             }
         }
-        export(&db, collection, &std::env::current_dir()?, &mut mp).await?;
+        export(&db, collection, &std::env::current_dir()?, &mut mp, false).await?;
         anyhow::Ok((total_files, payload_size, stats))
     };
     let (total_files, payload_size, stats) = select! {
