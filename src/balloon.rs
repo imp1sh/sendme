@@ -32,6 +32,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+use crate::config::Config;
 use crate::{
     apply_options, export, export_conflicts, get_or_create_secret, import, AddrInfoOptions,
 };
@@ -182,16 +183,27 @@ pub fn parse_ticket(input: &str) -> anyhow::Result<BlobTicket> {
 /// The transfer can be cancelled by sending to (or dropping) `cancel`.
 /// Terminates once the data was transferred completely to one peer, on
 /// cancellation, or on error.
+///
+/// `config` supplies the relay mode, import parallelism and the various
+/// timeouts, replacing previously hardcoded values.
 pub async fn send_file(
     path: PathBuf,
     events: mpsc::Sender<SendEvent>,
     cancel: oneshot::Receiver<()>,
+    config: Config,
 ) {
     // use a temp dir for the blob store, it is removed again afterwards
     let suffix = rand::rng().random::<[u8; 16]>();
     let blobs_data_dir =
         std::env::temp_dir().join(format!("sendme-balloon-send-{}", HEXLOWER.encode(&suffix)));
-    let res = send_file_inner(path, blobs_data_dir.clone(), events.clone(), cancel).await;
+    let res = send_file_inner(
+        path,
+        blobs_data_dir.clone(),
+        events.clone(),
+        cancel,
+        &config,
+    )
+    .await;
     tokio::fs::remove_dir_all(&blobs_data_dir).await.ok();
     if let Err(e) = res {
         events.send(SendEvent::Error(format!("{e:#}"))).await.ok();
@@ -203,9 +215,10 @@ async fn send_file_inner(
     blobs_data_dir: PathBuf,
     events: mpsc::Sender<SendEvent>,
     mut cancel: oneshot::Receiver<()>,
+    config: &Config,
 ) -> anyhow::Result<()> {
     let secret_key = get_or_create_secret(false)?;
-    let relay_mode = RelayMode::Default;
+    let relay_mode = config.relay_mode.to_relay_mode();
     let builder = Endpoint::builder(presets::N0)
         .alpns(vec![iroh_blobs::protocol::ALPN.to_vec()])
         .secret_key(secret_key)
@@ -239,7 +252,7 @@ async fn send_file_inner(
         FileKind::File
     };
     let mime = guess_mime(&path);
-    let (temp_tag, size, _collection) = import(path, blobs.store(), &mut mp, None).await?;
+    let (temp_tag, size, _collection) = import(path, blobs.store(), &mut mp, config.jobs).await?;
     let hash = temp_tag.hash();
 
     let router = iroh::protocol::Router::builder(endpoint)
@@ -248,11 +261,14 @@ async fn send_file_inner(
 
     // wait for the endpoint to figure out its address before making a ticket
     let ep = router.endpoint();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        if !matches!(relay_mode, RelayMode::Disabled) {
-            let _ = ep.online().await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(config.timeouts.endpoint_online_wait_secs),
+        async {
+            if !matches!(relay_mode, RelayMode::Disabled) {
+                let _ = ep.online().await;
+            }
+        },
+    )
     .await
     .ok();
 
@@ -357,9 +373,12 @@ async fn send_file_inner(
         events.send(SendEvent::Completed).await.ok();
     }
     drop(temp_tag);
-    tokio::time::timeout(Duration::from_secs(2), router.shutdown())
-        .await
-        .ok();
+    tokio::time::timeout(
+        Duration::from_secs(config.timeouts.router_shutdown_secs),
+        router.shutdown(),
+    )
+    .await
+    .ok();
     drop(router);
     store.shutdown().await.ok();
     Ok(())
@@ -379,13 +398,17 @@ fn is_peer_initiated_close(e: &anyhow::Error) -> bool {
 ///
 /// If saving would overwrite existing files, a [`ReceiveEvent::Conflict`] is
 /// emitted and the future pauses until a decision arrives on `decision_rx`.
+///
+/// `config` supplies the relay mode and download chunk size, replacing
+/// previously hardcoded values.
 pub async fn receive_ticket(
     ticket: BlobTicket,
     target_dir: PathBuf,
     events: mpsc::Sender<ReceiveEvent>,
     decision_rx: oneshot::Receiver<OverwriteDecision>,
+    config: Config,
 ) {
-    match receive_ticket_inner(&ticket, &target_dir, events.clone(), decision_rx).await {
+    match receive_ticket_inner(&ticket, &target_dir, events.clone(), decision_rx, &config).await {
         Ok(ReceiveOutcome::Saved) => {
             events
                 .send(ReceiveEvent::Completed { target: target_dir })
@@ -415,13 +438,14 @@ async fn receive_ticket_inner(
     target_dir: &Path,
     events: mpsc::Sender<ReceiveEvent>,
     decision_rx: oneshot::Receiver<OverwriteDecision>,
+    config: &Config,
 ) -> anyhow::Result<ReceiveOutcome> {
     let addr = ticket.addr().clone();
     let secret_key = get_or_create_secret(false)?;
     let mut builder = Endpoint::builder(presets::N0)
         .alpns(vec![])
         .secret_key(secret_key)
-        .relay_mode(RelayMode::Default);
+        .relay_mode(config.relay_mode.to_relay_mode());
     if ticket.addr().relay_urls().next().is_none() && ticket.addr().ip_addrs().next().is_none() {
         builder = builder.address_lookup(DnsAddressLookup::n0_dns());
     }
@@ -441,9 +465,13 @@ async fn receive_ticket_inner(
             events.send(ReceiveEvent::Connecting).await.ok();
             let connection = endpoint.connect(addr, iroh_blobs::protocol::ALPN).await?;
             connected = true;
-            let (_hash_seq, sizes) =
-                get_hash_seq_and_sizes(&connection, &hash_and_format.hash, 1024 * 1024 * 32, None)
-                    .await?;
+            let (_hash_seq, sizes) = get_hash_seq_and_sizes(
+                &connection,
+                &hash_and_format.hash,
+                config.chunk_size_bytes(),
+                None,
+            )
+            .await?;
             let total_size = sizes.iter().copied().sum::<u64>();
             let payload_size = sizes.iter().skip(2).copied().sum::<u64>();
             let total_files = (sizes.len().saturating_sub(1)) as u64;

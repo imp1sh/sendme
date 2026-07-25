@@ -19,7 +19,7 @@
 
 use std::{
     path::PathBuf,
-    sync::mpsc as std_mpsc,
+    sync::{mpsc as std_mpsc, Arc},
     time::{Duration, Instant},
 };
 
@@ -34,6 +34,7 @@ use sendme::balloon::{
     autostart_is_enabled, disable_autostart, enable_autostart, parse_ticket, receive_ticket,
     send_file, FileKind, OverwriteDecision, ReceiveEvent, SendEvent,
 };
+use sendme::config::{Config, ConflictDefault, NotificationConfig};
 use sendme::contacts::{
     create_contact_endpoint, load_or_create_secret, run_accept_loop, send_offer, AddressBook,
     Contact, IncomingOffer, OfferResult, TransferResult,
@@ -42,17 +43,35 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 #[cfg(target_os = "linux")]
 use winit::platform::x11::EventLoopBuilderExtX11;
 
-/// Fire a desktop notification for an incoming file transfer offer.
+/// Fire a desktop notification, honouring the user's notification settings.
 ///
 /// Spawns a detached thread so the DBus / NSUserNotification call cannot
 /// block the egui UI thread.  Errors are silently discarded — if no
 /// notification daemon is running (e.g. bare i3/sway without mako/dunst),
 /// the balloon's own visual change is the fallback.
+fn fire_notification(notif: &NotificationConfig, summary: &str, body: String) {
+    if !notif.enabled {
+        return;
+    }
+    let timeout_ms = (notif.timeout_seconds.saturating_mul(1000)).max(1000);
+    let summary = summary.to_string();
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .timeout(notify_rust::Timeout::Milliseconds(timeout_ms as u32))
+            .show();
+    });
+}
+
+/// Notification for an incoming transfer offer that awaits an Accept/Decline
+/// decision.
 ///
 /// When `contact_name` is `Some`, the sender is a known contact and the
 /// notification names them; otherwise the sender is flagged as unknown so
 /// the user can judge the request before accepting.
 fn notify_incoming_offer(
+    notif: &NotificationConfig,
     contact_name: Option<&str>,
     from_short: &str,
     name: &str,
@@ -64,21 +83,42 @@ fn notify_incoming_offer(
     let from_short = from_short.to_string();
     let name = name.to_string();
     let type_label = type_label(kind, mime);
-    std::thread::spawn(move || {
-        let who = match &contact_name {
-            Some(cn) => format!("your contact \"{cn}\""),
-            None => format!("an unknown sender ({from_short}) — not in your address book"),
-        };
-        let body = format!(
-            "{who} wants to send you: {name} ({}, {type_label})",
-            HumanBytes(size)
-        );
-        let _ = notify_rust::Notification::new()
-            .summary("sendme-balloon")
-            .body(&body)
-            .timeout(notify_rust::Timeout::Milliseconds(10000))
-            .show();
-    });
+    let who = match &contact_name {
+        Some(cn) => format!("your contact \"{cn}\""),
+        None => format!("an unknown sender ({from_short}) — not in your address book"),
+    };
+    let body = format!(
+        "{who} wants to send you: {name} ({}, {type_label})",
+        HumanBytes(size)
+    );
+    fire_notification(notif, "sendme-balloon: incoming transfer", body);
+}
+
+/// Notification for a transfer that was accepted automatically (global or
+/// per-contact auto-accept). Sent so the user is never surprised by files
+/// appearing on disk without any visible activity.
+fn notify_auto_accepted(
+    notif: &NotificationConfig,
+    contact_name: Option<&str>,
+    from_short: &str,
+    name: &str,
+    size: u64,
+    kind: FileKind,
+    mime: &str,
+) {
+    let contact_name = contact_name.map(|s| s.to_string());
+    let from_short = from_short.to_string();
+    let name = name.to_string();
+    let type_label = type_label(kind, mime);
+    let who = match &contact_name {
+        Some(cn) => format!("contact \"{cn}\""),
+        None => format!("unknown sender ({from_short})"),
+    };
+    let body = format!(
+        "Auto-accepted from {who}: {name} ({}, {type_label}). Saving to the default folder.",
+        HumanBytes(size)
+    );
+    fire_notification(notif, "sendme-balloon: auto-accepted", body);
 }
 
 /// Render a compact, human-readable label for an offered transfer's type,
@@ -299,6 +339,9 @@ struct BalloonApp {
     /// Our own contact-endpoint node id, for display/sharing.
     node_id: String,
     address_book: AddressBook,
+    /// The loaded YAML configuration. Edited by hand in a text editor, never
+    /// by the GUI.
+    config: Arc<Config>,
     /// oneshot used to report the user's accept/decline for the current
     /// incoming offer. Lives outside [`UiState`] so that state stays `Clone`.
     pending_offer_respond: Option<oneshot::Sender<bool>>,
@@ -309,19 +352,25 @@ struct BalloonApp {
     /// Text inputs for the add-contact form.
     add_contact_name: String,
     add_contact_node_id: String,
+    add_contact_email: String,
+    add_contact_auto_accept: bool,
     /// Whether autostart-at-login is currently enabled (cached at startup).
     autostart_enabled: bool,
     /// True while a contact-offer transfer is in progress. Suppresses the
     /// blobs-protocol ``Completed`` signal so the offer result (which
     /// distinguishes "saved" from "kept existing") is authoritative.
     offer_in_progress: bool,
+    /// True while a receive was auto-accepted (global or per-contact). Forces
+    /// conflicts to resolve safely (keep existing) instead of prompting, so an
+    /// unattended transfer never hangs waiting for a human decision.
+    auto_accepted_active: bool,
 }
 
 impl BalloonApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, config: Arc<Config>) -> Self {
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std_mpsc::channel();
-        spawn_worker(cc.egui_ctx.clone(), cmd_rx, evt_tx);
+        spawn_worker(cc.egui_ctx.clone(), cmd_rx, evt_tx, config.clone());
         Self {
             state: UiState::Idle,
             ticket_text: String::new(),
@@ -331,17 +380,34 @@ impl BalloonApp {
             evt_rx,
             node_id: String::new(),
             address_book: AddressBook::load().unwrap_or_default(),
+            config,
             pending_offer_respond: None,
             pending_offer_result: None,
             add_contact_name: String::new(),
             add_contact_node_id: String::new(),
+            add_contact_email: String::new(),
+            add_contact_auto_accept: false,
             autostart_enabled: autostart_is_enabled(),
             offer_in_progress: false,
+            auto_accepted_active: false,
         }
     }
 
     fn send_cmd(&self, cmd: Command) {
         self.cmd_tx.send(cmd).ok();
+    }
+
+    /// Whether auto-accept can fire for an incoming offer: a default save
+    /// folder must be configured, and either the global setting is on or the
+    /// sender is a contact with per-contact auto-accept enabled.
+    fn should_auto_accept(&self, offer: &IncomingOffer) -> bool {
+        if !self.config.auto_accept_possible() {
+            return false;
+        }
+        if let Some(c) = self.address_book.find_by_node_id(&offer.from) {
+            return c.auto_accept || self.config.auto_accept_offers;
+        }
+        self.config.auto_accept_offers
     }
 
     fn apply(&mut self, event: UiEvent) {
@@ -551,21 +617,48 @@ impl BalloonApp {
                     *status = "saving files ...".into();
                 }
                 (ReceiveEvent::Conflict { targets }, UiState::Receiving { .. }) => {
-                    self.state = UiState::ConfirmOverwrite { targets };
+                    // Resolve according to the configured default. An
+                    // auto-accepted (unattended) transfer must never block on
+                    // a prompt, so "ask" is downgraded to "keep existing" for
+                    // safety when auto-accept kicked the transfer off.
+                    let auto = self.auto_accepted_active;
+                    let decision = match (&self.config.conflict_default, auto) {
+                        (ConflictDefault::Overwrite, _) => OverwriteDecision::Overwrite,
+                        (ConflictDefault::KeepExisting, _) => OverwriteDecision::KeepExisting,
+                        (ConflictDefault::Ask, true) => OverwriteDecision::KeepExisting,
+                        (ConflictDefault::Ask, false) => {
+                            self.state = UiState::ConfirmOverwrite { targets };
+                            return;
+                        }
+                    };
+                    let label = if matches!(decision, OverwriteDecision::Overwrite) {
+                        "overwriting …"
+                    } else {
+                        "keeping existing …"
+                    };
+                    self.send_cmd(Command::ResolveConflict(decision));
+                    self.state = UiState::Receiving {
+                        status: label.into(),
+                        current: 0,
+                        total: 0,
+                    };
                 }
                 (
                     ReceiveEvent::KeptExisting { target },
                     UiState::ConfirmOverwrite { .. } | UiState::Receiving { .. },
                 ) => {
+                    self.auto_accepted_active = false;
                     self.state = UiState::ReceiveKept { target };
                 }
                 (ReceiveEvent::Completed { target }, UiState::Receiving { .. }) => {
+                    self.auto_accepted_active = false;
                     self.state = UiState::ReceiveDone { target };
                 }
                 (
                     ReceiveEvent::SenderCancelled,
                     UiState::Receiving { .. } | UiState::PickingFolder,
                 ) => {
+                    self.auto_accepted_active = false;
                     self.state = UiState::Error {
                         message: "the sender cancelled the transfer".into(),
                     };
@@ -574,6 +667,7 @@ impl BalloonApp {
                     ReceiveEvent::Error(message),
                     UiState::Receiving { .. } | UiState::PickingFolder,
                 ) => {
+                    self.auto_accepted_active = false;
                     self.state = UiState::Error { message };
                 }
                 _ => {}
@@ -585,11 +679,45 @@ impl BalloonApp {
                 if matches!(self.state, UiState::Idle) {
                     // Resolve the sender against the address book so the UI
                     // can tell known contacts apart from unknown senders.
-                    let contact_name = self
-                        .address_book
-                        .find_by_node_id(&offer.from)
-                        .map(|c| c.name.clone());
+                    let contact = self.address_book.find_by_node_id(&offer.from);
+                    let contact_name = contact.map(|c| c.name.clone());
+
+                    // Auto-accept: when enabled (globally or for this contact)
+                    // AND a default save folder is configured, accept without
+                    // prompting. The user is still notified so files never
+                    // appear on disk silently.
+                    if self.should_auto_accept(&offer) {
+                        let from_short = offer.from_short.clone();
+                        let name = offer.name.clone();
+                        let size = offer.size;
+                        let kind = offer.kind;
+                        let mime = offer.mime.clone();
+                        let ticket = offer.ticket.clone();
+                        // accept the offer on the network…
+                        let _ = offer.respond.send(true);
+                        // …and report the transfer outcome back to the sender.
+                        let result_tx = Some(offer.result_tx);
+                        notify_auto_accepted(
+                            &self.config.notifications,
+                            contact_name.as_deref(),
+                            &from_short,
+                            &name,
+                            size,
+                            kind,
+                            &mime,
+                        );
+                        self.auto_accepted_active = true;
+                        self.state = UiState::Receiving {
+                            status: format!("auto-accepted from {from_short}, connecting …"),
+                            current: 0,
+                            total: 0,
+                        };
+                        self.send_cmd(Command::ReceiveOffer { ticket, result_tx });
+                        return;
+                    }
+
                     notify_incoming_offer(
+                        &self.config.notifications,
                         contact_name.as_deref(),
                         &offer.from_short,
                         &offer.name,
@@ -658,6 +786,7 @@ impl BalloonApp {
             self.pending_offer_result.take();
         }
         self.offer_in_progress = false;
+        self.auto_accepted_active = false;
         match &self.state {
             UiState::PickingFile
             | UiState::Preparing { .. }
@@ -679,9 +808,8 @@ impl BalloonApp {
     fn desired_size(&self) -> Vec2 {
         match self.state {
             UiState::Idle => IDLE_SIZE,
-            UiState::AddressBook | UiState::AddContact { .. } | UiState::PickContact { .. } => {
-                Vec2::new(370.0, 320.0)
-            }
+            UiState::AddressBook | UiState::PickContact { .. } => Vec2::new(370.0, 360.0),
+            UiState::AddContact { .. } => Vec2::new(370.0, 400.0),
             UiState::IncomingOffer { .. } => Vec2::new(370.0, 290.0),
             _ => Vec2::new(370.0, 250.0),
         }
@@ -1044,11 +1172,24 @@ impl BalloonApp {
                         egui::Button::new("Receive"),
                     );
                     if ok.clicked() {
-                        self.state = UiState::PickingFolder;
-                        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-                        self.send_cmd(Command::Receive {
-                            ticket: self.ticket_text.clone(),
-                        });
+                        if self.config.default_folder().is_some() {
+                            // a default folder is configured: skip the picker
+                            // and go straight to the receiving state.
+                            self.state = UiState::Receiving {
+                                status: "connecting ...".into(),
+                                current: 0,
+                                total: 0,
+                            };
+                            self.send_cmd(Command::Receive {
+                                ticket: self.ticket_text.clone(),
+                            });
+                        } else {
+                            self.state = UiState::PickingFolder;
+                            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                            self.send_cmd(Command::Receive {
+                                ticket: self.ticket_text.clone(),
+                            });
+                        }
                     }
                     if ui.button("Cancel").clicked() {
                         self.state = UiState::Idle;
@@ -1195,17 +1336,44 @@ impl BalloonApp {
                     }
                 });
                 ui.add_space(4.0);
+                // Warn when auto-accept is enabled (globally or for any contact)
+                // but cannot actually fire because no default save folder is
+                // configured. Without that folder the picker cannot be skipped,
+                // so auto-accept would hang waiting for a human.
+                let any_auto = self.config.auto_accept_offers
+                    || self.address_book.contacts.iter().any(|c| c.auto_accept);
+                if any_auto && self.config.default_folder().is_none() {
+                    ui.colored_label(
+                        AMBER,
+                        "Auto-accept is enabled but no default_save_folder is set \
+                         in config.yaml. Set one, or auto-accept will be ignored.",
+                    );
+                    ui.add_space(4.0);
+                }
                 if self.address_book.contacts.is_empty() {
                     ui.label("(no contacts yet)");
                 } else {
                     egui::ScrollArea::vertical()
-                        .max_height(130.0)
+                        .max_height(150.0)
                         .show(ui, |ui| {
                             let mut to_remove: Option<String> = None;
-                            for c in &self.address_book.contacts {
+                            let mut dirty = false;
+                            for i in 0..self.address_book.contacts.len() {
                                 ui.horizontal(|ui| {
+                                    let c = &mut self.address_book.contacts[i];
                                     ui.label(RichText::new(&c.name).strong());
                                     ui.label(RichText::new(short_id(&c.node_id)).weak().size(10.0));
+                                    if !c.email.is_empty() {
+                                        ui.label(RichText::new(&c.email).weak().size(10.0));
+                                    }
+                                    let before = c.auto_accept;
+                                    ui.checkbox(&mut c.auto_accept, "auto").on_hover_text(
+                                        "Accept transfers from this contact without prompting. \
+                                         Needs a default_save_folder to take effect.",
+                                    );
+                                    if c.auto_accept != before {
+                                        dirty = true;
+                                    }
                                     if ui
                                         .small_button("🗑")
                                         .on_hover_text("remove contact")
@@ -1217,6 +1385,9 @@ impl BalloonApp {
                             }
                             if let Some(id) = to_remove {
                                 self.address_book.remove(&id);
+                                dirty = true;
+                            }
+                            if dirty {
                                 let _ = self.address_book.save();
                             }
                         });
@@ -1226,6 +1397,8 @@ impl BalloonApp {
                     if ui.button("➕ Add contact").clicked() {
                         self.add_contact_name.clear();
                         self.add_contact_node_id.clear();
+                        self.add_contact_email.clear();
+                        self.add_contact_auto_accept = false;
                         self.state = UiState::AddContact { error: None };
                     }
                     if ui.button("Back").clicked() {
@@ -1244,6 +1417,28 @@ impl BalloonApp {
                         .font(egui::TextStyle::Monospace)
                         .hint_text("paste the 256-bit node id"),
                 );
+                ui.add_space(4.0);
+                ui.label("Email (optional, for your reference):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.add_contact_email)
+                        .hint_text("alice@example.com"),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.add_contact_auto_accept,
+                    "Auto-accept from this contact",
+                )
+                .on_hover_text(
+                    "Accept transfers from this contact without prompting. \
+                         Needs a default_save_folder in config.yaml to take effect.",
+                );
+                if self.add_contact_auto_accept && self.config.default_folder().is_none() {
+                    ui.colored_label(
+                        AMBER,
+                        "No default_save_folder is set. Auto-accept will be ignored \
+                         until you set one in config.yaml.",
+                    );
+                }
                 if let Some(err) = &error {
                     ui.colored_label(Color32::from_rgb(230, 90, 90), err);
                 }
@@ -1260,6 +1455,8 @@ impl BalloonApp {
                                 let contact = Contact {
                                     name: self.add_contact_name.trim().to_string(),
                                     node_id: self.add_contact_node_id.trim().to_string(),
+                                    email: self.add_contact_email.trim().to_string(),
+                                    auto_accept: self.add_contact_auto_accept,
                                 };
                                 self.address_book.contacts.push(contact);
                                 let _ = self.address_book.save();
@@ -1419,9 +1616,18 @@ impl BalloonApp {
                             let _ = r.send(true);
                         }
                         let result_tx = self.pending_offer_result.take();
-                        self.state = UiState::PickingFolder;
-                        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-                        self.send_cmd(Command::ReceiveOffer { ticket, result_tx });
+                        if self.config.default_folder().is_some() {
+                            self.state = UiState::Receiving {
+                                status: "connecting ...".into(),
+                                current: 0,
+                                total: 0,
+                            };
+                            self.send_cmd(Command::ReceiveOffer { ticket, result_tx });
+                        } else {
+                            self.state = UiState::PickingFolder;
+                            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                            self.send_cmd(Command::ReceiveOffer { ticket, result_tx });
+                        }
                     }
                     if ui.button("✘ Decline").clicked() {
                         if let Some(r) = self.pending_offer_respond.take() {
@@ -1498,6 +1704,7 @@ fn start_send(
     cancel_send: &mut Option<oneshot::Sender<()>>,
     evt_tx: &std_mpsc::Sender<UiEvent>,
     ctx: &egui::Context,
+    config: Arc<Config>,
 ) {
     let name = path
         .file_name()
@@ -1509,7 +1716,7 @@ fn start_send(
     let (c_tx, c_rx) = oneshot::channel();
     *cancel_send = Some(c_tx);
     let (se_tx, mut se_rx) = tokio_mpsc::channel(64);
-    tokio::spawn(send_file(path, se_tx, c_rx));
+    tokio::spawn(send_file(path, se_tx, c_rx, (*config).clone()));
 
     let evt_tx = evt_tx.clone();
     let ctx = ctx.clone();
@@ -1522,6 +1729,7 @@ fn start_send(
 }
 
 /// Kick off a receive after a save folder has been chosen.
+#[allow(clippy::too_many_arguments)]
 fn start_receive(
     ticket: BlobTicket,
     dir: PathBuf,
@@ -1530,6 +1738,7 @@ fn start_receive(
     ctx: &egui::Context,
     decision_rx: oneshot::Receiver<OverwriteDecision>,
     result_tx: Option<oneshot::Sender<TransferResult>>,
+    config: Arc<Config>,
 ) {
     let _ = evt_tx.send(UiEvent::ReceiveStarting);
     ctx.request_repaint();
@@ -1539,6 +1748,7 @@ fn start_receive(
         dir,
         re_tx,
         decision_rx,
+        (*config).clone(),
     )));
     let evt_tx = evt_tx.clone();
     let ctx = ctx.clone();
@@ -1582,6 +1792,7 @@ fn spawn_worker(
     ctx: egui::Context,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>,
     evt_tx: std_mpsc::Sender<UiEvent>,
+    config: Arc<Config>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1597,7 +1808,7 @@ fn spawn_worker(
             // persistent contact endpoint for ticket offers
             let contact_ep = match async {
                 let secret = load_or_create_secret()?;
-                let ep = create_contact_endpoint(secret).await?;
+                let ep = create_contact_endpoint(secret, config.relay_mode.to_relay_mode()).await?;
                 anyhow::Ok(ep)
             }
             .await
@@ -1605,7 +1816,12 @@ fn spawn_worker(
                 Ok(ep) => {
                     emit(UiEvent::NodeIdReady(ep.id().to_string()));
                     let (offer_tx, mut offer_rx) = tokio_mpsc::channel::<IncomingOffer>(16);
-                    tokio::spawn(run_accept_loop(ep.clone(), offer_tx));
+                    tokio::spawn(run_accept_loop(
+                        ep.clone(),
+                        offer_tx,
+                        config.heartbeat_interval(),
+                        Duration::from_secs(config.timeouts.offer_conn_close_wait_secs),
+                    ));
                     let evt_tx2 = evt_tx.clone();
                     let ctx2 = ctx.clone();
                     tokio::spawn(async move {
@@ -1644,11 +1860,12 @@ fn spawn_worker(
                                 &mut cancel_send,
                                 &evt_tx,
                                 &ctx,
+                                config.clone(),
                             ),
                         }
                     }
                     Command::SendPath(path) => {
-                        start_send(path, &mut cancel_send, &evt_tx, &ctx);
+                        start_send(path, &mut cancel_send, &evt_tx, &ctx, config.clone());
                     }
                     Command::SendOffer {
                         node_id,
@@ -1694,24 +1911,33 @@ fn spawn_worker(
                             emit(UiEvent::TicketInvalid(e.to_string()));
                         }
                         Ok(ticket) => {
-                            let dir = rfd::AsyncFileDialog::new()
-                                .set_title("sendme: choose where to save")
-                                .pick_folder()
-                                .await;
-                            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                            match dir {
+                            // Use the configured default folder if set, skipping
+                            // the folder picker; otherwise ask the user.
+                            let target = match config.default_folder() {
+                                Some(folder) => Some(folder.to_path_buf()),
+                                None => {
+                                    let dir = rfd::AsyncFileDialog::new()
+                                        .set_title("sendme: choose where to save")
+                                        .pick_folder()
+                                        .await;
+                                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                                    dir.map(|d| d.path().to_path_buf())
+                                }
+                            };
+                            match target {
                                 None => emit(UiEvent::FolderPickCancelled),
                                 Some(dir) => {
                                     let (dc_tx, dc_rx) = oneshot::channel();
                                     conflict_respond = Some(dc_tx);
                                     start_receive(
                                         ticket,
-                                        dir.path().to_path_buf(),
+                                        dir,
                                         &mut recv_task,
                                         &evt_tx,
                                         &ctx,
                                         dc_rx,
                                         None,
+                                        config.clone(),
                                     );
                                 }
                             }
@@ -1723,24 +1949,31 @@ fn spawn_worker(
                             emit(UiEvent::TicketInvalid(e.to_string()));
                         }
                         Ok(ticket) => {
-                            let dir = rfd::AsyncFileDialog::new()
-                                .set_title("sendme: choose where to save")
-                                .pick_folder()
-                                .await;
-                            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                            match dir {
+                            let target = match config.default_folder() {
+                                Some(folder) => Some(folder.to_path_buf()),
+                                None => {
+                                    let dir = rfd::AsyncFileDialog::new()
+                                        .set_title("sendme: choose where to save")
+                                        .pick_folder()
+                                        .await;
+                                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                                    dir.map(|d| d.path().to_path_buf())
+                                }
+                            };
+                            match target {
                                 None => emit(UiEvent::OfferFolderCancelled),
                                 Some(dir) => {
                                     let (dc_tx, dc_rx) = oneshot::channel();
                                     conflict_respond = Some(dc_tx);
                                     start_receive(
                                         ticket,
-                                        dir.path().to_path_buf(),
+                                        dir,
                                         &mut recv_task,
                                         &evt_tx,
                                         &ctx,
                                         dc_rx,
                                         result_tx,
+                                        config.clone(),
                                     );
                                 }
                             }
@@ -1763,7 +1996,17 @@ fn spawn_worker(
 }
 
 fn main() -> eframe::Result {
-    tracing_subscriber::fmt::init();
+    // Initialise logging. The `RUST_LOG` environment variable, if set, takes
+    // precedence; otherwise the `log_level` from config.yaml is used.
+    use tracing_subscriber::EnvFilter;
+    let config = Config::load().unwrap_or_else(|e| {
+        eprintln!("warning: loading config failed, using defaults: {e:#}");
+        Config::default()
+    });
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let config = Arc::new(config);
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_inner_size(IDLE_SIZE)
@@ -1791,7 +2034,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "sendme balloon",
         options,
-        Box::new(|cc| Ok(Box::new(BalloonApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(BalloonApp::new(cc, config.clone())))),
     )
 }
 
@@ -1812,12 +2055,16 @@ mod tests {
                 evt_rx,
                 node_id: String::new(),
                 address_book: AddressBook::default(),
+                config: Arc::new(Config::default()),
                 pending_offer_respond: None,
                 pending_offer_result: None,
                 add_contact_name: String::new(),
                 add_contact_node_id: String::new(),
+                add_contact_email: String::new(),
+                add_contact_auto_accept: false,
                 autostart_enabled: false,
                 offer_in_progress: false,
+                auto_accepted_active: false,
             },
             cmd_rx,
         )
@@ -2043,5 +2290,108 @@ mod tests {
         let (mut app, _cmds) = app_in_state(UiState::Idle);
         app.apply(UiEvent::Receive(ReceiveEvent::SenderCancelled));
         assert!(matches!(app.state, UiState::Idle));
+    }
+
+    /// Helper: build an IncomingOffer for a real node id, with throwaway
+    /// reply channels.
+    fn make_offer(from: &str) -> IncomingOffer {
+        let (respond, _rx) = oneshot::channel();
+        let (result_tx, _rx) = oneshot::channel();
+        IncomingOffer {
+            from: from.to_string(),
+            from_short: "short".into(),
+            name: "pic.png".into(),
+            size: 42,
+            kind: FileKind::File,
+            mime: "image/png".into(),
+            ticket: "tk".into(),
+            respond,
+            result_tx,
+        }
+    }
+
+    fn with_default_folder(app: &mut BalloonApp, folder: &str) {
+        let cfg = Config {
+            default_save_folder: Some(PathBuf::from(folder)),
+            ..Config::default()
+        };
+        app.config = Arc::new(cfg);
+    }
+
+    #[test]
+    fn auto_accept_ignored_without_default_folder_even_if_contact_opted_in() {
+        use iroh::SecretKey;
+        let key = SecretKey::generate();
+        let id_str = key.public().to_string();
+        let offer = make_offer(&id_str);
+        let (mut app, _cmds) = app_in_state(UiState::Idle);
+        app.address_book.contacts.push(Contact {
+            name: "alice".into(),
+            node_id: id_str,
+            email: String::new(),
+            auto_accept: true,
+        });
+        // contact opted in, but no default folder -> cannot auto-accept
+        assert!(!app.should_auto_accept(&offer));
+    }
+
+    #[test]
+    fn auto_accept_fires_for_opted_in_contact_when_folder_set() {
+        use iroh::SecretKey;
+        let key = SecretKey::generate();
+        let id_str = key.public().to_string();
+        let offer = make_offer(&id_str);
+        let (mut app, _cmds) = app_in_state(UiState::Idle);
+        app.address_book.contacts.push(Contact {
+            name: "alice".into(),
+            node_id: id_str.clone(),
+            email: "alice@example.com".into(),
+            auto_accept: true,
+        });
+        with_default_folder(&mut app, "/tmp/sendme");
+        assert!(app.should_auto_accept(&offer));
+    }
+
+    #[test]
+    fn global_auto_accept_applies_to_unknown_senders_only_with_folder() {
+        use iroh::SecretKey;
+        let key = SecretKey::generate();
+        let id_str = key.public().to_string(); // not in the address book
+        let offer = make_offer(&id_str);
+        let (mut app, _cmds) = app_in_state(UiState::Idle);
+        // global on, no folder -> ignored
+        let cfg = Config {
+            auto_accept_offers: true,
+            ..Config::default()
+        };
+        app.config = Arc::new(cfg);
+        assert!(!app.should_auto_accept(&offer));
+        // folder set -> now accepts even unknown senders
+        with_default_folder(&mut app, "/tmp/sendme");
+        // with_default_folder resets auto_accept_offers to false, so set again
+        let cfg = Config {
+            auto_accept_offers: true,
+            default_save_folder: Some(PathBuf::from("/tmp/sendme")),
+            ..Config::default()
+        };
+        app.config = Arc::new(cfg);
+        assert!(app.should_auto_accept(&offer));
+    }
+
+    #[test]
+    fn auto_accept_off_for_normal_contact_when_global_off() {
+        use iroh::SecretKey;
+        let key = SecretKey::generate();
+        let id_str = key.public().to_string();
+        let offer = make_offer(&id_str);
+        let (mut app, _cmds) = app_in_state(UiState::Idle);
+        app.address_book.contacts.push(Contact {
+            name: "bob".into(),
+            node_id: id_str,
+            email: String::new(),
+            auto_accept: false,
+        });
+        with_default_folder(&mut app, "/tmp/sendme");
+        assert!(!app.should_auto_accept(&offer));
     }
 }

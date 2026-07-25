@@ -2,6 +2,7 @@
 use std::time::Duration;
 
 use sendme::balloon::{parse_ticket, receive_ticket, send_file, ReceiveEvent, SendEvent};
+use sendme::config::Config;
 use tokio::sync::{mpsc, oneshot};
 
 #[tokio::test]
@@ -14,7 +15,7 @@ async fn balloon_send_receive() -> anyhow::Result<()> {
 
     let (se_tx, mut se_rx) = mpsc::channel(64);
     let (_cancel_tx, cancel_rx) = oneshot::channel();
-    let send_task = tokio::spawn(send_file(file, se_tx, cancel_rx));
+    let send_task = tokio::spawn(send_file(file, se_tx, cancel_rx, Config::default()));
 
     // wait for the ticket
     let ticket = loop {
@@ -37,6 +38,7 @@ async fn balloon_send_receive() -> anyhow::Result<()> {
         tgt_dir.path().to_path_buf(),
         re_tx,
         decide_rx,
+        Config::default(),
     ));
     // wait for the receiver to finish
     loop {

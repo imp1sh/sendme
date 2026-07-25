@@ -50,8 +50,8 @@ const RESULT_ERROR: u8 = 5;
 /// data on the stream resets the QUIC idle timer on both sides, so this keeps
 /// the connection alive across what may be a multi-minute human pause.
 const HEARTBEAT_BYTE: u8 = 0xFE;
-/// How often the receiver sends a heartbeat while waiting for the user.
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+// The heartbeat cadence is configurable via
+// `Config::heartbeat_interval_secs`; the built-in default is 3 seconds.
 
 /// The outcome of an outgoing offer, reported by the receiver after the
 /// transfer attempt finishes.
@@ -79,10 +79,24 @@ pub enum TransferResult {
 ///
 /// The node id is stored as its canonical string form so the address book
 /// remains human-readable and survives upgrades of the underlying encoding.
+///
+/// The `email` and `auto_accept` fields were added later and carry
+/// `#[serde(default)]`, so older address book JSON files (written before these
+/// fields existed) keep loading: missing fields become `""` and `false`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
     pub name: String,
     pub node_id: String,
+    /// Optional email address, as a cross-reference to a real person behind
+    /// the node id. Free-text, not used for any network behaviour.
+    #[serde(default)]
+    pub email: String,
+    /// When `true`, transfer offers from this contact are accepted
+    /// automatically (no Accept/Decline prompt). Requires a default save
+    /// folder to be configured; otherwise this flag is ignored. Overrides the
+    /// global `auto_accept_offers` setting for this contact.
+    #[serde(default)]
+    pub auto_accept: bool,
 }
 
 impl Contact {
@@ -211,11 +225,17 @@ pub fn load_or_create_secret() -> anyhow::Result<SecretKey> {
 /// us by [`EndpointId`] alone) and a DNS address lookup (so we can dial peers
 /// by their [`EndpointId`]); together with [`RelayMode::Default`] this gives
 /// working node-id-only connectivity.
-pub async fn create_contact_endpoint(secret: SecretKey) -> anyhow::Result<Endpoint> {
+///
+/// `relay_mode` is taken from the user's configuration so the contact
+/// endpoint honours the same relay setting as the transfer endpoints.
+pub async fn create_contact_endpoint(
+    secret: SecretKey,
+    relay_mode: RelayMode,
+) -> anyhow::Result<Endpoint> {
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![OFFER_ALPN.to_vec()])
         .secret_key(secret)
-        .relay_mode(RelayMode::Default)
+        .relay_mode(relay_mode)
         .bind()
         .await?;
     Ok(endpoint)
@@ -417,7 +437,17 @@ pub async fn send_offer(
 /// through `offer_tx` as an [`IncomingOffer`] (which carries a oneshot the GUI
 /// uses to report the accept/decline decision). The per-connection task then
 /// awaits that decision and writes the matching ack byte back to the peer.
-pub async fn run_accept_loop(endpoint: Endpoint, offer_tx: mpsc::Sender<IncomingOffer>) {
+///
+/// `heartbeat_interval` replaces the historic fixed [`HEARTBEAT_INTERVAL`] so
+/// the cadence is configurable; `conn_close_wait` bounds how long the task
+/// waits for the sender to acknowledge the reply before dropping the
+/// connection.
+pub async fn run_accept_loop(
+    endpoint: Endpoint,
+    offer_tx: mpsc::Sender<IncomingOffer>,
+    heartbeat_interval: std::time::Duration,
+    conn_close_wait: std::time::Duration,
+) {
     loop {
         let incoming = match endpoint.accept().await {
             Some(incoming) => incoming,
@@ -489,7 +519,7 @@ pub async fn run_accept_loop(endpoint: Endpoint, offer_tx: mpsc::Sender<Incoming
             // keeping the connection alive across a multi-minute human pause.
             let accepted = loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
+                    _ = tokio::time::sleep(heartbeat_interval) => {
                         if send.write_all(&[HEARTBEAT_BYTE]).await.is_err() {
                             break false;
                         }
@@ -510,7 +540,7 @@ pub async fn run_accept_loop(endpoint: Endpoint, offer_tx: mpsc::Sender<Incoming
             if accepted {
                 loop {
                     tokio::select! {
-                        _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
+                        _ = tokio::time::sleep(heartbeat_interval) => {
                             if send.write_all(&[HEARTBEAT_BYTE]).await.is_err() {
                                 break;
                             }
@@ -539,7 +569,7 @@ pub async fn run_accept_loop(endpoint: Endpoint, offer_tx: mpsc::Sender<Incoming
             // The sender closes the connection only AFTER send_offer() reads
             // the ack and returns, so conn.closed() resolving is proof the ack
             // was received.  The timeout is a safety net for pathological cases.
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), conn.closed()).await;
+            let _ = tokio::time::timeout(conn_close_wait, conn.closed()).await;
             // keep the endpoint alive for the lifetime of this task
             drop(endpoint);
         });
@@ -630,10 +660,14 @@ mod tests {
                 Contact {
                     name: "alice".into(),
                     node_id: "aaa".into(),
+                    email: String::new(),
+                    auto_accept: false,
                 },
                 Contact {
                     name: "bob".into(),
                     node_id: "bbb".into(),
+                    email: String::new(),
+                    auto_accept: false,
                 },
             ],
         };
@@ -654,10 +688,14 @@ mod tests {
                 Contact {
                     name: "alice".into(),
                     node_id: id_str.clone(),
+                    email: String::new(),
+                    auto_accept: false,
                 },
                 Contact {
                     name: "bob".into(),
                     node_id: "bbb".into(),
+                    email: String::new(),
+                    auto_accept: false,
                 },
             ],
         };
@@ -667,5 +705,19 @@ mod tests {
         assert!(book.find_by_node_id("not-a-real-node-id").is_none());
         // bob's stored node id is not a valid EndpointId, so it can't match
         assert!(book.find_by_node_id("bbb").is_none());
+    }
+
+    #[test]
+    fn legacy_address_book_loads_with_defaults() {
+        // An address book written before the email/auto_accept fields existed.
+        // It must still load, with the new fields defaulting to empty/false.
+        // The on-disk shape is {"contacts": [...]}, as written by AddressBook::save.
+        let json = r#"{"contacts":[{"name":"alice","node_id":"aaa"}]}"#;
+        let book: AddressBook = serde_json::from_str(json).unwrap();
+        assert_eq!(book.contacts.len(), 1);
+        assert_eq!(book.contacts[0].name, "alice");
+        assert_eq!(book.contacts[0].node_id, "aaa");
+        assert_eq!(book.contacts[0].email, "");
+        assert!(!book.contacts[0].auto_accept);
     }
 }
