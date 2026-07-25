@@ -42,6 +42,30 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 #[cfg(target_os = "linux")]
 use winit::platform::x11::EventLoopBuilderExtX11;
 
+/// Fire a desktop notification for an incoming file transfer offer.
+///
+/// Spawns a detached thread so the DBus / NSUserNotification call cannot
+/// block the egui UI thread.  Errors are silently discarded — if no
+/// notification daemon is running (e.g. bare i3/sway without mako/dunst),
+/// the balloon's own visual change is the fallback.
+fn notify_incoming_offer(from_short: &str, name: &str, size: u64) {
+    let from = from_short.to_string();
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        let body = format!(
+            "{} wants to send you: {} ({})",
+            from,
+            name,
+            HumanBytes(size)
+        );
+        let _ = notify_rust::Notification::new()
+            .summary("sendme-balloon")
+            .body(&body)
+            .timeout(notify_rust::Timeout::Milliseconds(10000))
+            .show();
+    });
+}
+
 /// Commands from the GUI to the background worker.
 enum Command {
     PickAndSend,
@@ -381,6 +405,7 @@ impl BalloonApp {
             }
             UiEvent::OfferReceived(offer) => {
                 if matches!(self.state, UiState::Idle) {
+                    notify_incoming_offer(&offer.from_short, &offer.name, offer.size);
                     self.pending_offer_respond = Some(offer.respond);
                     self.state = UiState::IncomingOffer {
                         from_short: offer.from_short,
