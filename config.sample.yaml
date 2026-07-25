@@ -138,11 +138,16 @@
 # Uncomment the `notifications:` line and any individual child you want to
 # change; children left commented fall back to their own built-in defaults.
 #
-# defaults: enabled=true, urgency=normal, timeout=10s
+# `urgency` is the one lever that works consistently across daemons: on
+# Sway/mako/dunst it controls the popup colour and whether it auto-expires
+# or stays until dismissed. The exact timing for low/normal is governed by
+# your notification daemon's own config (dunstrc, mako config, …), not by
+# sendme-balloon — this avoids a knob that most Sway setups silently ignore.
+#
+# default: enabled=true, urgency=normal
 # notifications:
 #   enabled: true
 #   urgency: normal
-#   timeout_seconds: 10
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # One of: error, warn, info, debug, trace.

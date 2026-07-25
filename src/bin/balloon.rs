@@ -55,12 +55,13 @@ fn fire_notification(notif: &NotificationConfig, summary: &str, body: String) {
     }
     let urgency = notif.urgency.to_notify_rust();
     // Per the freedesktop spec, critical notifications should not auto-expire.
-    // Honour that regardless of the configured timeout_seconds.
+    // For low/normal we let the notification daemon decide its own timeout
+    // (dunst, mako, swaync, GNOME, … all configure expiry per urgency), so
+    // we don't send a client-side timeout hint that most Sway daemons ignore.
     let timeout = if urgency == notify_rust::Urgency::Critical {
         notify_rust::Timeout::Never
     } else {
-        let timeout_ms = (notif.timeout_seconds.saturating_mul(1000)).max(1000);
-        notify_rust::Timeout::Milliseconds(timeout_ms as u32)
+        notify_rust::Timeout::Default
     };
     let summary = summary.to_string();
     std::thread::spawn(move || {

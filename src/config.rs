@@ -144,11 +144,6 @@ pub struct NotificationConfig {
     /// dismissed.
     #[serde(default)]
     pub urgency: NotificationUrgency,
-    /// How long the notification stays on screen, in seconds. Ignored when
-    /// urgency is `critical` (those stay until dismissed per the freedesktop
-    /// spec).
-    #[serde(default = "default_notification_timeout")]
-    pub timeout_seconds: u64,
 }
 
 impl Default for NotificationConfig {
@@ -158,16 +153,12 @@ impl Default for NotificationConfig {
         Self {
             enabled: default_notifications_enabled(),
             urgency: NotificationUrgency::default(),
-            timeout_seconds: default_notification_timeout(),
         }
     }
 }
 
 fn default_notifications_enabled() -> bool {
     true
-}
-fn default_notification_timeout() -> u64 {
-    10
 }
 
 /// The balloon configuration.
@@ -426,7 +417,7 @@ mod tests {
         assert_eq!(cfg.log_level, "warn");
         assert_eq!(cfg.timeouts.endpoint_online_wait_secs, 30);
         assert!(cfg.notifications.enabled);
-        assert_eq!(cfg.notifications.timeout_seconds, 10);
+        assert_eq!(cfg.notifications.urgency, NotificationUrgency::Normal);
     }
 
     #[test]
@@ -504,7 +495,7 @@ mod tests {
         assert!(matches!(cfg.conflict_default, ConflictDefault::Ask));
         assert_eq!(cfg.timeouts.endpoint_online_wait_secs, 30);
         assert!(cfg.notifications.enabled);
-        assert_eq!(cfg.notifications.timeout_seconds, 10);
+        assert_eq!(cfg.notifications.urgency, NotificationUrgency::Normal);
         assert_eq!(cfg.log_level, "warn");
     }
 
@@ -592,10 +583,6 @@ mod tests {
             default.timeouts.offer_conn_close_wait_secs
         );
         assert_eq!(cfg.notifications.enabled, default.notifications.enabled);
-        assert_eq!(
-            cfg.notifications.timeout_seconds,
-            default.notifications.timeout_seconds
-        );
         assert_eq!(cfg.notifications.urgency, default.notifications.urgency);
     }
 
