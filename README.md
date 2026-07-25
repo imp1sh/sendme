@@ -72,9 +72,13 @@ curl -fsSL https://raw.githubusercontent.com/imp1sh/sendme-balloon/main/scripts/
 Autostart can also be toggled at any time from inside the app — open the
 address book (round button on the balloon) and use the "Start at login"
 checkbox. This uses the XDG autostart standard (`~/.config/autostart/`) and
-works on GNOME, KDE Plasma, Cinnamon, MATE, XFCE, LXQt, and Sway. On bare
-tiling window managers like i3 or Hyprland, add `exec sendme-balloon` to your
-WM config manually.
+works on GNOME, KDE Plasma, Cinnamon, MATE, XFCE, and LXQt. Bare tiling
+window managers such as i3, Sway, and Hyprland do not implement the XDG
+autostart spec, so the checkbox writes the `.desktop` file but nothing
+launches it; add `exec sendme-balloon` to your WM config manually. On Sway
+(or any tiling WM) you can alternatively install `dex-autostart` and add
+`exec dex -a -s ~/.config/autostart/:/etc/xdg/autostart/` to your config so
+the in-app checkbox takes effect.
 
 ## Build from source
 

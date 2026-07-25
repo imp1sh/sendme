@@ -808,7 +808,12 @@ impl BalloonApp {
     fn desired_size(&self) -> Vec2 {
         match self.state {
             UiState::Idle => IDLE_SIZE,
-            UiState::AddressBook | UiState::PickContact { .. } => Vec2::new(370.0, 360.0),
+            // Roomier than the other panels so the "Start at login" tooltip
+            // (which explains the XDG-autostart / bare-WM caveats) has space
+            // to render fully without being clipped by the tiny frameless
+            // window.
+            UiState::AddressBook => Vec2::new(560.0, 460.0),
+            UiState::PickContact { .. } => Vec2::new(370.0, 360.0),
             UiState::AddContact { .. } => Vec2::new(370.0, 400.0),
             UiState::IncomingOffer { .. } => Vec2::new(370.0, 290.0),
             _ => Vec2::new(370.0, 250.0),
@@ -1318,7 +1323,14 @@ impl BalloonApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let before = self.autostart_enabled;
-                    ui.checkbox(&mut self.autostart_enabled, "Start at login");
+                    ui.checkbox(&mut self.autostart_enabled, "Start at login")
+                        .on_hover_text(
+                            "Uses the XDG autostart standard (~/.config/autostart/). \
+                             Works on GNOME, KDE, Cinnamon, MATE, XFCE and LXQt. \
+                             Bare tiling WMs (i3, Sway, Hyprland, ...) do not launch \
+                             XDG entries themselves — install dex-autostart or add \
+                             `exec sendme-balloon` to your WM config manually.",
+                        );
                     if self.autostart_enabled != before {
                         if self.autostart_enabled {
                             match enable_autostart() {
