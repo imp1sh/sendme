@@ -108,6 +108,7 @@ ensure_rust() {
         command -v curl >/dev/null 2>&1 || die "curl not found — install curl first"
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain "${required}" \
+                       -c rustfmt,clippy \
             || die "rustup installation failed"
         # shellcheck disable=SC1091
         . "$HOME/.cargo/env"
@@ -118,20 +119,27 @@ ensure_rust() {
 
     # cargo present — is it rustup-managed?
     if command -v rustup >/dev/null 2>&1; then
-        rustup toolchain install "${required}" --profile minimal >/dev/null 2>&1 \
+        rustup toolchain install "${required}" --profile minimal -c rustfmt,clippy >/dev/null 2>&1 \
             || die "failed to install toolchain ${required} via rustup"
         # Pin the toolchain for THIS session only (does not change the user's
         # global default), so every `cargo` call below uses the pinned version.
         export RUSTUP_TOOLCHAIN="${required}"
         ok "using rustup toolchain ${required} for this session"
     else
-        # Non-rustup cargo (distro package, etc.) — just verify the version.
+        # Non-rustup cargo (distro package, etc.) — verify the version and
+        # that rustfmt/clippy are available (some distros split them into
+        # separate packages: rustfmt, clippy).
         local installed
         installed=$(rustc --version | awk '{print $2}')
-        if version_ge "$installed" "${required}"; then
-            ok "host cargo ${installed} (>= ${required})"
-        else
+        if ! version_ge "$installed" "${required}"; then
             die "host cargo ${installed} is older than ${required}; install rustup (https://rustup.rs) or upgrade Rust"
         fi
+        local missing=""
+        command -v rustfmt       >/dev/null 2>&1 || missing="${missing} rustfmt"
+        command -v cargo-clippy  >/dev/null 2>&1 || missing="${missing} clippy"
+        if [[ -n "$missing" ]]; then
+            die "host cargo ${installed} ok but missing:${missing} — install via your package manager (e.g. \`dnf install rustfmt clippy\`) or switch to rustup (https://rustup.rs)"
+        fi
+        ok "host cargo ${installed} (>= ${required}), rustfmt + clippy present"
     fi
 }
