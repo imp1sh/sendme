@@ -5,6 +5,8 @@ pub mod balloon;
 pub mod config;
 #[cfg(feature = "balloon")]
 pub mod contacts;
+#[cfg(feature = "balloon")]
+pub mod transfers;
 
 use std::{
     collections::BTreeMap,
