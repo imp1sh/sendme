@@ -1,9 +1,12 @@
 //! Integration test for the sendme balloon backend.
 use std::time::Duration;
 
-use sendme::balloon::{parse_ticket, receive_ticket, send_file, ReceiveEvent, SendEvent};
+use sendme::balloon::{
+    parse_ticket, receive_ticket, send_file, ConflictResolver, ReceiveEvent, SendEvent,
+};
 use sendme::config::Config;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 #[tokio::test]
 async fn balloon_send_receive() -> anyhow::Result<()> {
@@ -33,11 +36,22 @@ async fn balloon_send_receive() -> anyhow::Result<()> {
 
     let (re_tx, mut re_rx) = mpsc::channel(64);
     let (_decide_tx, decide_rx) = oneshot::channel();
+    let export_lock = Arc::new(Mutex::new(()));
+    // Create a shared receive endpoint (mirrors what the worker does).
+    let recv_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .alpns(vec![])
+        .secret_key(iroh::SecretKey::generate())
+        .relay_mode(iroh::RelayMode::Default)
+        .address_lookup(iroh::address_lookup::dns::DnsAddressLookup::n0_dns())
+        .bind()
+        .await?;
     tokio::spawn(receive_ticket(
+        recv_endpoint,
         ticket,
         tgt_dir.path().to_path_buf(),
         re_tx,
-        decide_rx,
+        ConflictResolver::Prompt(decide_rx),
+        export_lock,
         Config::default(),
     ));
     // wait for the receiver to finish

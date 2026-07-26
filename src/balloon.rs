@@ -7,12 +7,13 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use data_encoding::HEXLOWER;
 use indicatif::{MultiProgress, ProgressDrawTarget};
-use iroh::{address_lookup::dns::DnsAddressLookup, endpoint::presets, Endpoint, RelayMode};
+use iroh::{endpoint::presets, Endpoint, RelayMode};
 use iroh_blobs::{
     api::remote::GetProgressItem,
     format::collection::Collection,
@@ -29,7 +30,7 @@ use n0_future::StreamExt;
 use rand::RngExt;
 use tokio::{
     select,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Mutex},
 };
 
 use crate::config::Config;
@@ -156,6 +157,26 @@ pub enum OverwriteDecision {
     Overwrite,
     /// Leave the existing files untouched; do not save the incoming ones.
     KeepExisting,
+}
+
+/// How a receive resolves a filename conflict (when the target file already
+/// exists).
+///
+/// Manual receives (the user pasted a ticket) use [`Self::Prompt`]: the receive
+/// emits a [`ReceiveEvent::Conflict`] and waits for the GUI to deliver the
+/// user's decision on the embedded oneshot.
+///
+/// Managed receives (offers handled by the transfer manager) use
+/// [`Self::Auto`]: the decision is taken from the configuration up front, with
+/// no prompt and no `Conflict` event. This keeps background/parallel transfers
+/// from stalling on a human decision.
+#[derive(Debug)]
+pub enum ConflictResolver {
+    /// Emit a [`ReceiveEvent::Conflict`] and wait on this oneshot for the
+    /// user's decision.
+    Prompt(oneshot::Receiver<OverwriteDecision>),
+    /// Resolve automatically with this decision (no prompt, no event).
+    Auto(OverwriteDecision),
 }
 
 /// Outcome of a receive, reported back to the caller so it can emit the
@@ -397,18 +418,44 @@ fn is_peer_initiated_close(e: &anyhow::Error) -> bool {
 /// Receive the data behind `ticket` and save it below `target_dir`.
 ///
 /// If saving would overwrite existing files, a [`ReceiveEvent::Conflict`] is
-/// emitted and the future pauses until a decision arrives on `decision_rx`.
+/// emitted (only for the [`ConflictResolver::Prompt`] variant) and the future
+/// pauses until a decision arrives on the embedded oneshot. The
+/// [`ConflictResolver::Auto`] variant resolves conflicts silently using the
+/// pre-supplied decision.
+///
+/// `endpoint` is a shared iroh endpoint used to connect to the sender. Sharing
+/// one endpoint across all concurrent receives (instead of creating one per
+/// receive) saves sockets, relay state and magicsocket overhead. The caller
+/// owns the endpoint's lifecycle; this function does NOT close it.
+///
+/// `export_lock` serialises the conflict-check + export phase across parallel
+/// receives so two transfers racing for the same filename cannot both write.
+/// Downloads still run in parallel; only the final file-placement step is
+/// serialised. Pass a shared lock for all concurrent receives; `Arc::new(
+/// Mutex::new(()))` for a stand-alone receive.
 ///
 /// `config` supplies the relay mode and download chunk size, replacing
 /// previously hardcoded values.
 pub async fn receive_ticket(
+    endpoint: Endpoint,
     ticket: BlobTicket,
     target_dir: PathBuf,
     events: mpsc::Sender<ReceiveEvent>,
-    decision_rx: oneshot::Receiver<OverwriteDecision>,
+    conflict: ConflictResolver,
+    export_lock: Arc<Mutex<()>>,
     config: Config,
 ) {
-    match receive_ticket_inner(&ticket, &target_dir, events.clone(), decision_rx, &config).await {
+    match receive_ticket_inner(
+        &endpoint,
+        &ticket,
+        &target_dir,
+        events.clone(),
+        conflict,
+        export_lock,
+        &config,
+    )
+    .await
+    {
         Ok(ReceiveOutcome::Saved) => {
             events
                 .send(ReceiveEvent::Completed { target: target_dir })
@@ -434,22 +481,15 @@ pub async fn receive_ticket(
 }
 
 async fn receive_ticket_inner(
+    endpoint: &Endpoint,
     ticket: &BlobTicket,
     target_dir: &Path,
     events: mpsc::Sender<ReceiveEvent>,
-    decision_rx: oneshot::Receiver<OverwriteDecision>,
+    conflict: ConflictResolver,
+    export_lock: Arc<Mutex<()>>,
     config: &Config,
 ) -> anyhow::Result<ReceiveOutcome> {
     let addr = ticket.addr().clone();
-    let secret_key = get_or_create_secret(false)?;
-    let mut builder = Endpoint::builder(presets::N0)
-        .alpns(vec![])
-        .secret_key(secret_key)
-        .relay_mode(config.relay_mode.to_relay_mode());
-    if ticket.addr().relay_urls().next().is_none() && ticket.addr().ip_addrs().next().is_none() {
-        builder = builder.address_lookup(DnsAddressLookup::n0_dns());
-    }
-    let endpoint = builder.bind().await?;
     // temp dir for the blob store; keyed by hash so interrupted downloads resume
     let iroh_data_dir =
         std::env::temp_dir().join(format!("sendme-balloon-recv-{}", ticket.hash().to_hex()));
@@ -503,6 +543,13 @@ async fn receive_ticket_inner(
             }
         }
         let collection = Collection::load(hash_and_format.hash, db.as_ref()).await?;
+        // Serialise the conflict-check + export phase across parallel receives.
+        // Two transfers racing for the same filename would otherwise both see
+        // "no conflict" and both try to write, with the second one erroring
+        // inside `export`. The lock only covers placement, not the download,
+        // so parallel downloads are unaffected.
+        let mut conflict = conflict;
+        let _guard = export_lock.lock().await;
         let conflicts = export_conflicts(&collection, target_dir)?;
         if conflicts.is_empty() {
             events.send(ReceiveEvent::Exporting).await.ok();
@@ -510,11 +557,18 @@ async fn receive_ticket_inner(
             export(&db, collection, target_dir, &mut mp, false).await?;
             anyhow::Ok(ReceiveOutcome::Saved)
         } else {
-            events
-                .send(ReceiveEvent::Conflict { targets: conflicts })
-                .await
-                .ok();
-            let decision = decision_rx.await.unwrap_or(OverwriteDecision::KeepExisting);
+            // Resolve the conflict: prompt the user (manual receives) or use
+            // the pre-supplied automatic decision (managed receives).
+            let decision = match &mut conflict {
+                ConflictResolver::Prompt(decision_rx) => {
+                    events
+                        .send(ReceiveEvent::Conflict { targets: conflicts })
+                        .await
+                        .ok();
+                    decision_rx.await.unwrap_or(OverwriteDecision::KeepExisting)
+                }
+                ConflictResolver::Auto(d) => *d,
+            };
             match decision {
                 OverwriteDecision::KeepExisting => anyhow::Ok(ReceiveOutcome::KeptExisting),
                 OverwriteDecision::Overwrite => {
@@ -527,7 +581,8 @@ async fn receive_ticket_inner(
         }
     }
     .await;
-    endpoint.close().await;
+    // The endpoint is shared across all concurrent receives; do NOT close it
+    // here. The caller (worker) owns its lifecycle.
     db.shutdown().await.ok();
     // A peer-initiated close after we connected means the sender cancelled
     // the transfer. Translate that into a clear outcome instead of leaking a
@@ -598,6 +653,36 @@ pub fn disable_autostart() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Disk-space guard ───────────────────────────────────────────────────────
+
+/// Return the available space (in bytes) on the filesystem containing `path`.
+///
+/// On Unix this calls `statvfs(2)` via the `libc` crate. On non-Unix platforms
+/// (or if the syscall fails) it returns `None`, which callers treat as "skip
+/// the guard" so the app degrades gracefully instead of refusing to run.
+#[cfg(feature = "balloon")]
+pub fn available_space(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        let c_path = CString::new(path.to_str()?).ok()?;
+        let mut statv: libc::statvfs = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut statv) };
+        if ret != 0 {
+            return None;
+        }
+        // frsize * bavail gives the actual free bytes available to us.
+        let frsize = statv.f_frsize as u64;
+        let bavail = statv.f_bavail as u64;
+        Some(frsize.saturating_mul(bavail))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,5 +709,17 @@ mod tests {
         let inner = std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out");
         let e = anyhow::Error::new(inner).context("connecting to sender");
         assert!(!is_peer_initiated_close(&e));
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn available_space_returns_positive_for_temp_dir() {
+        let dir = std::env::temp_dir();
+        let space = available_space(&dir);
+        // On all realistic platforms /tmp has at least 1 KiB free.
+        // If the platform lacks the syscall, None is acceptable.
+        if let Some(s) = space {
+            assert!(s > 1024, "expected >1KiB free, got {s}");
+        }
     }
 }

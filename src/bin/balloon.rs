@@ -18,8 +18,9 @@
 //!   is fetched automatically.
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
-    sync::{mpsc as std_mpsc, Arc},
+    sync::{mpsc as std_mpsc, Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
@@ -31,15 +32,20 @@ use indicatif::HumanBytes;
 use iroh::EndpointId;
 use iroh_blobs::ticket::BlobTicket;
 use sendme::balloon::{
-    autostart_is_enabled, disable_autostart, enable_autostart, parse_ticket, receive_ticket,
-    send_file, FileKind, OverwriteDecision, ReceiveEvent, SendEvent,
+    autostart_is_enabled, available_space, disable_autostart, enable_autostart, parse_ticket,
+    receive_ticket, send_file, ConflictResolver, FileKind, OverwriteDecision, ReceiveEvent,
+    SendEvent,
 };
 use sendme::config::{Config, ConflictDefault, NotificationConfig};
 use sendme::contacts::{
     create_contact_endpoint, load_or_create_secret, run_accept_loop, send_offer, AddressBook,
-    Contact, IncomingOffer, OfferResult, TransferResult,
+    Contact, OfferResult,
 };
-use tokio::sync::{mpsc as tokio_mpsc, oneshot};
+use sendme::transfers::{
+    CancelKind, CompletionOutcome, ContactIndex, DrainActions, ManagerEvent, OfferDispatch,
+    OfferId, OfferInfo, ReceiveParams, TransferManager, TransfersSnapshot,
+};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex as TokioMutex};
 #[cfg(target_os = "linux")]
 use winit::platform::x11::EventLoopBuilderExtX11;
 
@@ -124,33 +130,6 @@ fn notify_incoming_offer(
     fire_notification(notif, "sendme-balloon: incoming transfer", body);
 }
 
-/// Notification for a transfer that was accepted automatically (global or
-/// per-contact auto-accept). Sent so the user is never surprised by files
-/// appearing on disk without any visible activity.
-fn notify_auto_accepted(
-    notif: &NotificationConfig,
-    contact_name: Option<&str>,
-    from_short: &str,
-    name: &str,
-    size: u64,
-    kind: FileKind,
-    mime: &str,
-) {
-    let contact_name = contact_name.map(|s| s.to_string());
-    let from_short = from_short.to_string();
-    let name = name.to_string();
-    let type_label = type_label(kind, mime);
-    let who = match &contact_name {
-        Some(cn) => format!("contact \"{cn}\""),
-        None => format!("unknown sender ({from_short})"),
-    };
-    let body = format!(
-        "Auto-accepted from {who}: {name} ({}, {type_label}). Saving to the default folder.",
-        HumanBytes(size)
-    );
-    fire_notification(notif, "sendme-balloon: auto-accepted", body);
-}
-
 /// Render a compact, human-readable label for an offered transfer's type,
 /// e.g. "directory", "PDF (application/pdf)" or just "file".
 fn type_label(kind: FileKind, mime: &str) -> String {
@@ -222,18 +201,33 @@ enum Command {
         mime: String,
     },
     CancelSend,
+    /// Manual receive: the user pasted a ticket. Goes through its own single
+    /// receive (not the manager's queue), but shares the export lock.
     Receive {
         ticket: String,
     },
-    /// Begin receiving a ticket that arrived via an accepted offer.
-    ReceiveOffer {
-        ticket: String,
-        /// Used to report the transfer outcome back to the sender via the
-        /// offer stream. ``None`` for manual (non-offer) receives.
-        result_tx: Option<oneshot::Sender<TransferResult>>,
+    /// The user accepted an interactive-lane offer prompt. The worker resolves
+    /// the save folder (configured default or a picker), then asks the manager
+    /// to start the receive.
+    AcceptOffer {
+        id: OfferId,
     },
+    /// The user declined an interactive-lane offer prompt.
+    DeclineOffer {
+        id: OfferId,
+    },
+    /// Cancel an active managed transfer (or one in the queue).
+    CancelTransfer {
+        id: OfferId,
+    },
+    /// Toggle block mode (reject all new offers).
+    SetBlockMode(bool),
+    /// Push a fresh contact index to the manager (call after every address
+    /// book edit so future offers get the right lane/priority).
+    UpdateContacts(ContactIndex),
+    /// Cancel a manual (pasted-ticket) receive.
     CancelReceive,
-    /// User decided whether to overwrite existing files during a receive.
+    /// User decided whether to overwrite existing files during a manual receive.
     ResolveConflict(OverwriteDecision),
 }
 
@@ -246,15 +240,20 @@ enum UiEvent {
     },
     Send(SendEvent),
     TicketInvalid(String),
+    /// The save-folder picker was cancelled during a manual (pasted-ticket)
+    /// receive — return to the ticket-entry screen.
     FolderPickCancelled,
-    /// The save-folder picker was cancelled during an offer-initiated receive.
+    /// The save-folder picker was cancelled while accepting an offer — the
+    /// offer is declined, return to idle.
     OfferFolderCancelled,
     ReceiveStarting,
     Receive(ReceiveEvent),
     /// Our own contact-endpoint node id is known.
     NodeIdReady(String),
-    /// A remote peer pushed a transfer ticket to us.
-    OfferReceived(IncomingOffer),
+    /// An interactive-lane offer reached the front of the queue and needs an
+    /// accept/decline decision. Replaces the old `OfferReceived` (which was
+    /// gated on `UiState::Idle`); the manager now decides when to prompt.
+    PromptOffer(OfferInfo),
     /// The contact accepted our outgoing offer and saved the file(s).
     OfferTransferSaved {
         name: String,
@@ -263,10 +262,14 @@ enum UiEvent {
     OfferKeptExisting {
         name: String,
     },
-    /// The contact declined our outgoing offer.
+    /// The contact declined our outgoing offer (permanent no).
     OfferRejected,
+    /// The contact was overloaded (queue full); the sender may retry shortly.
+    OfferHalted,
     /// Something went wrong with an outgoing offer (or the contact endpoint).
     OfferError(String),
+    /// The block mode changed (startup value or user toggle).
+    BlockModeChanged(bool),
 }
 
 #[derive(Clone)]
@@ -302,10 +305,17 @@ enum UiState {
     /// The folder picker dialog is showing and the balloon is hidden.
     PickingFolder,
     /// Download in progress.
+    ///
+    /// `offer_id` is `Some(id)` when this receive was started by the transfer
+    /// manager (an accepted offer). Cancelling it must go through
+    /// `Command::CancelTransfer` so the manager cleans up and the queue
+    /// drains. It is `None` for manual (pasted-ticket) receives, which are
+    /// cancelled via `Command::CancelReceive`.
     Receiving {
         status: String,
         current: u64,
         total: u64,
+        offer_id: Option<OfferId>,
     },
     /// Download finished and saved.
     ReceiveDone { target: PathBuf },
@@ -346,15 +356,25 @@ enum UiState {
     /// from a known contact. It is `None` when the sender is unknown, in
     /// which case the UI warns the user that the sender is not in the
     /// address book.
+    ///
+    /// The `id` identifies the offer to the transfer manager; the Accept /
+    /// Decline buttons send `Command::AcceptOffer` / `Command::DeclineOffer`
+    /// with it. The actual ticket and result channels stay in the manager.
     IncomingOffer {
+        id: OfferId,
         from_short: String,
         contact_name: Option<String>,
         name: String,
         size: u64,
         kind: FileKind,
         mime: String,
-        ticket: String,
     },
+    /// Activity panel: shows active transfers, the queue and the recent
+    /// event log. Reachable from the idle balloon via the activity button.
+    /// Background (auto-lane) transfers keep running while this panel is
+    /// open; an interactive-lane prompt arriving from the manager will
+    /// transition away to `IncomingOffer` (correct — it needs attention).
+    Activity,
 }
 
 const SEND_COLOR: Color32 = Color32::from_rgb(66, 133, 244);
@@ -379,13 +399,11 @@ struct BalloonApp {
     /// The loaded YAML configuration. Edited by hand in a text editor, never
     /// by the GUI.
     config: Arc<Config>,
-    /// oneshot used to report the user's accept/decline for the current
-    /// incoming offer. Lives outside [`UiState`] so that state stays `Clone`.
-    pending_offer_respond: Option<oneshot::Sender<bool>>,
-    /// oneshot used to report the transfer outcome back to the sender.
-    /// Taken when the user accepts an incoming offer and passed to the
-    /// worker via [`Command::ReceiveOffer`].
-    pending_offer_result: Option<oneshot::Sender<TransferResult>>,
+    /// Shared snapshot of the transfer manager's state, read each frame to
+    /// render the activity panel. Updated by the worker.
+    snapshot: Arc<StdMutex<TransfersSnapshot>>,
+    /// Mirror of the manager's block mode, for display.
+    block_mode: bool,
     /// Text inputs for the add-contact form.
     add_contact_name: String,
     add_contact_node_id: String,
@@ -397,10 +415,6 @@ struct BalloonApp {
     /// blobs-protocol ``Completed`` signal so the offer result (which
     /// distinguishes "saved" from "kept existing") is authoritative.
     offer_in_progress: bool,
-    /// True while a receive was auto-accepted (global or per-contact). Forces
-    /// conflicts to resolve safely (keep existing) instead of prompting, so an
-    /// unattended transfer never hangs waiting for a human decision.
-    auto_accepted_active: bool,
     /// The filesystem path of the file currently being sent, retained so a
     /// "Rename & Retry" can copy and re-send it if the peer reports a name
     /// collision.
@@ -423,8 +437,16 @@ impl BalloonApp {
     fn new(cc: &eframe::CreationContext<'_>, config: Arc<Config>) -> Self {
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std_mpsc::channel();
-        spawn_worker(cc.egui_ctx.clone(), cmd_rx, evt_tx, config.clone());
-        Self {
+        let snapshot = Arc::new(StdMutex::new(TransfersSnapshot::default()));
+        let block_mode = config.block_mode;
+        spawn_worker(
+            cc.egui_ctx.clone(),
+            cmd_rx,
+            evt_tx,
+            config.clone(),
+            snapshot.clone(),
+        );
+        let app = Self {
             state: UiState::Idle,
             ticket_text: String::new(),
             copied_at: None,
@@ -434,37 +456,35 @@ impl BalloonApp {
             node_id: String::new(),
             address_book: AddressBook::load().unwrap_or_default(),
             config,
-            pending_offer_respond: None,
-            pending_offer_result: None,
+            snapshot,
+            block_mode,
             add_contact_name: String::new(),
             add_contact_node_id: String::new(),
             add_contact_email: String::new(),
             add_contact_auto_accept: false,
             autostart_enabled: autostart_is_enabled(),
             offer_in_progress: false,
-            auto_accepted_active: false,
             last_send_path: None,
             last_offer_contact: None,
             retry_contact: None,
             retry_count: 0,
-        }
+        };
+        // Push the initial address book so the manager can classify the first
+        // incoming offers (lane + priority) without waiting for an edit.
+        app.sync_contacts();
+        app
     }
 
     fn send_cmd(&self, cmd: Command) {
         self.cmd_tx.send(cmd).ok();
     }
 
-    /// Whether auto-accept can fire for an incoming offer: a default save
-    /// folder must be configured, and either the global setting is on or the
-    /// sender is a contact with per-contact auto-accept enabled.
-    fn should_auto_accept(&self, offer: &IncomingOffer) -> bool {
-        if !self.config.auto_accept_possible() {
-            return false;
-        }
-        if let Some(c) = self.address_book.find_by_node_id(&offer.from) {
-            return c.auto_accept || self.config.auto_accept_offers;
-        }
-        self.config.auto_accept_offers
+    /// Push the current address book to the transfer manager so future offers
+    /// get the right lane (auto vs interactive) and priority (contact vs
+    /// stranger). Call after every address book mutation.
+    fn sync_contacts(&self) {
+        let idx = ContactIndex::from_address_book(&self.address_book);
+        self.send_cmd(Command::UpdateContacts(idx));
     }
 
     fn apply(&mut self, event: UiEvent) {
@@ -669,6 +689,7 @@ impl BalloonApp {
                         status: "connecting ...".into(),
                         current: 0,
                         total: 0,
+                        offer_id: None,
                     };
                 }
             }
@@ -704,16 +725,14 @@ impl BalloonApp {
                     *status = "saving files ...".into();
                 }
                 (ReceiveEvent::Conflict { targets }, UiState::Receiving { .. }) => {
-                    // Resolve according to the configured default. An
-                    // auto-accepted (unattended) transfer must never block on
-                    // a prompt, so "ask" is downgraded to "keep existing" for
-                    // safety when auto-accept kicked the transfer off.
-                    let auto = self.auto_accepted_active;
-                    let decision = match (&self.config.conflict_default, auto) {
-                        (ConflictDefault::Overwrite, _) => OverwriteDecision::Overwrite,
-                        (ConflictDefault::KeepExisting, _) => OverwriteDecision::KeepExisting,
-                        (ConflictDefault::Ask, true) => OverwriteDecision::KeepExisting,
-                        (ConflictDefault::Ask, false) => {
+                    // Only manual (pasted-ticket) reaches here: managed (offer)
+                    // receives resolve conflicts automatically via the
+                    // transfer manager. Apply the configured default; "ask"
+                    // prompts the user.
+                    let decision = match &self.config.conflict_default {
+                        ConflictDefault::Overwrite => OverwriteDecision::Overwrite,
+                        ConflictDefault::KeepExisting => OverwriteDecision::KeepExisting,
+                        ConflictDefault::Ask => {
                             self.state = UiState::ConfirmOverwrite { targets };
                             return;
                         }
@@ -728,24 +747,22 @@ impl BalloonApp {
                         status: label.into(),
                         current: 0,
                         total: 0,
+                        offer_id: None,
                     };
                 }
                 (
                     ReceiveEvent::KeptExisting { target },
                     UiState::ConfirmOverwrite { .. } | UiState::Receiving { .. },
                 ) => {
-                    self.auto_accepted_active = false;
                     self.state = UiState::ReceiveKept { target };
                 }
                 (ReceiveEvent::Completed { target }, UiState::Receiving { .. }) => {
-                    self.auto_accepted_active = false;
                     self.state = UiState::ReceiveDone { target };
                 }
                 (
                     ReceiveEvent::SenderCancelled,
                     UiState::Receiving { .. } | UiState::PickingFolder,
                 ) => {
-                    self.auto_accepted_active = false;
                     self.state = UiState::Error {
                         message: "the sender cancelled the transfer".into(),
                     };
@@ -754,7 +771,6 @@ impl BalloonApp {
                     ReceiveEvent::Error(message),
                     UiState::Receiving { .. } | UiState::PickingFolder,
                 ) => {
-                    self.auto_accepted_active = false;
                     self.state = UiState::Error { message };
                 }
                 _ => {}
@@ -762,71 +778,31 @@ impl BalloonApp {
             UiEvent::NodeIdReady(id) => {
                 self.node_id = id;
             }
-            UiEvent::OfferReceived(offer) => {
-                if matches!(self.state, UiState::Idle) {
-                    // Resolve the sender against the address book so the UI
-                    // can tell known contacts apart from unknown senders.
-                    let contact = self.address_book.find_by_node_id(&offer.from);
-                    let contact_name = contact.map(|c| c.name.clone());
-
-                    // Auto-accept: when enabled (globally or for this contact)
-                    // AND a default save folder is configured, accept without
-                    // prompting. The user is still notified so files never
-                    // appear on disk silently.
-                    if self.should_auto_accept(&offer) {
-                        let from_short = offer.from_short.clone();
-                        let name = offer.name.clone();
-                        let size = offer.size;
-                        let kind = offer.kind;
-                        let mime = offer.mime.clone();
-                        let ticket = offer.ticket.clone();
-                        // accept the offer on the network…
-                        let _ = offer.respond.send(true);
-                        // …and report the transfer outcome back to the sender.
-                        let result_tx = Some(offer.result_tx);
-                        notify_auto_accepted(
-                            &self.config.notifications,
-                            contact_name.as_deref(),
-                            &from_short,
-                            &name,
-                            size,
-                            kind,
-                            &mime,
-                        );
-                        self.auto_accepted_active = true;
-                        self.state = UiState::Receiving {
-                            status: format!("auto-accepted from {from_short}, connecting …"),
-                            current: 0,
-                            total: 0,
-                        };
-                        self.send_cmd(Command::ReceiveOffer { ticket, result_tx });
-                        return;
-                    }
-
-                    notify_incoming_offer(
-                        &self.config.notifications,
-                        contact_name.as_deref(),
-                        &offer.from_short,
-                        &offer.name,
-                        offer.size,
-                        offer.kind,
-                        &offer.mime,
-                    );
-                    self.pending_offer_respond = Some(offer.respond);
-                    self.pending_offer_result = Some(offer.result_tx);
-                    self.state = UiState::IncomingOffer {
-                        from_short: offer.from_short,
-                        contact_name,
-                        name: offer.name,
-                        size: offer.size,
-                        kind: offer.kind,
-                        mime: offer.mime,
-                        ticket: offer.ticket,
-                    };
-                } else {
-                    // busy: decline so the sender does not hang
-                    let _ = offer.respond.send(false);
-                }
+            UiEvent::PromptOffer(info) => {
+                // The transfer manager surfaced an interactive-lane offer that
+                // reached the front of the queue. Show the Accept/Decline UI.
+                // Unlike the old `OfferReceived` path this is NOT gated on
+                // `UiState::Idle` — the manager decides when to prompt, so an
+                // informational dialog or an in-progress send no longer causes
+                // the offer to be rejected.
+                notify_incoming_offer(
+                    &self.config.notifications,
+                    info.contact_name.as_deref(),
+                    &info.from_short,
+                    &info.name,
+                    info.size,
+                    info.kind,
+                    &info.mime,
+                );
+                self.state = UiState::IncomingOffer {
+                    id: info.id,
+                    from_short: info.from_short,
+                    contact_name: info.contact_name,
+                    name: info.name,
+                    size: info.size,
+                    kind: info.kind,
+                    mime: info.mime,
+                };
             }
             UiEvent::OfferTransferSaved { name } => {
                 self.offer_in_progress = false;
@@ -872,18 +848,29 @@ impl BalloonApp {
                     self.state = UiState::Error { message };
                 }
             }
+            UiEvent::OfferHalted => {
+                self.offer_in_progress = false;
+                if matches!(self.state, UiState::OfferPending { .. }) {
+                    self.send_cmd(Command::CancelSend);
+                    self.state = UiState::Error {
+                        message: "the contact is currently busy (queue full). \
+                                  Try again shortly."
+                            .into(),
+                    };
+                }
+            }
+            UiEvent::BlockModeChanged(blocked) => {
+                self.block_mode = blocked;
+            }
         }
     }
 
     fn close_operation(&mut self) {
-        // declining a pending incoming offer: dropping the oneshot sender
-        // makes the accept loop treat it as a rejection.
-        if matches!(self.state, UiState::IncomingOffer { .. }) {
-            self.pending_offer_respond.take();
-            self.pending_offer_result.take();
+        // Closing an incoming-offer prompt declines it via the manager.
+        if let UiState::IncomingOffer { id, .. } = &self.state {
+            self.send_cmd(Command::DeclineOffer { id: *id });
         }
         self.offer_in_progress = false;
-        self.auto_accepted_active = false;
         self.retry_contact = None;
         match &self.state {
             UiState::PickingFile
@@ -892,7 +879,16 @@ impl BalloonApp {
             | UiState::OfferPending { .. } => {
                 self.send_cmd(Command::CancelSend);
             }
-            UiState::PickingFolder | UiState::Receiving { .. } => {
+            UiState::PickingFolder => {
+                self.send_cmd(Command::CancelReceive);
+            }
+            UiState::Receiving {
+                offer_id: Some(id),
+                ..
+            } => {
+                self.send_cmd(Command::CancelTransfer { id: *id });
+            }
+            UiState::Receiving { .. } => {
                 self.send_cmd(Command::CancelReceive);
             }
             UiState::ConfirmOverwrite { .. } => {
@@ -911,6 +907,7 @@ impl BalloonApp {
             // to render fully without being clipped by the tiny frameless
             // window.
             UiState::AddressBook => Vec2::new(560.0, 460.0),
+            UiState::Activity => Vec2::new(500.0, 560.0),
             UiState::PickContact { .. } => Vec2::new(370.0, 360.0),
             UiState::AddContact { .. } => Vec2::new(370.0, 400.0),
             UiState::IncomingOffer { .. } => Vec2::new(370.0, 290.0),
@@ -1091,6 +1088,64 @@ impl BalloonApp {
         );
         if btn_resp.clicked() {
             self.state = UiState::AddressBook;
+            return;
+        }
+
+        // activity button: small round button to the RIGHT of the contacts
+        // button, on the dividing line. Shows a badge with the total count of
+        // active + queued transfers when > 0.
+        let act_center = Pos2::new(center.x + 24.0, center.y);
+        let act_rect = Rect::from_center_size(act_center, Vec2::splat(22.0));
+        let act_resp = ui.interact(act_rect, ui.id().with("activity"), Sense::click());
+        let act_hover = act_resp.hovered();
+        let act_col = if act_hover {
+            Color32::from_gray(70)
+        } else {
+            Color32::from_gray(50)
+        };
+        painter.circle_filled(act_center, 10.0, act_col);
+        painter.circle_stroke(act_center, 10.0, Stroke::new(1.5, Color32::WHITE));
+        painter.text(
+            act_center,
+            Align2::CENTER_CENTER,
+            "📋",
+            FontId::proportional(11.0),
+            Color32::WHITE,
+        );
+
+        // badge: small coloured circle at the top-right of the activity button
+        // showing the total count of active + queued transfers.
+        let snap = self.snapshot.lock().unwrap();
+        let total = snap.active.len() + snap.queued.len();
+        drop(snap);
+        if total > 0 {
+            let badge_pos = Pos2::new(act_center.x + 9.0, act_center.y - 9.0);
+            let badge_col = {
+                let s = self.snapshot.lock().unwrap();
+                if !s.active.is_empty() {
+                    RECV_COLOR
+                } else {
+                    AMBER
+                }
+            };
+            painter.circle_filled(badge_pos, 7.0, badge_col);
+            painter.circle_stroke(badge_pos, 7.0, Stroke::new(1.0, Color32::BLACK));
+            let badge_text = if total > 9 {
+                "9+".to_string()
+            } else {
+                total.to_string()
+            };
+            painter.text(
+                badge_pos,
+                Align2::CENTER_CENTER,
+                &badge_text,
+                FontId::proportional(9.0),
+                Color32::WHITE,
+            );
+        }
+
+        if act_resp.clicked() {
+            self.state = UiState::Activity;
             return;
         }
 
@@ -1338,6 +1393,7 @@ impl BalloonApp {
                                 status: "connecting ...".into(),
                                 current: 0,
                                 total: 0,
+                                offer_id: None,
                             };
                             self.send_cmd(Command::Receive {
                                 ticket: self.ticket_text.clone(),
@@ -1367,6 +1423,7 @@ impl BalloonApp {
                 status,
                 current,
                 total,
+                ..
             } => {
                 self.title_bar(ui, ctx, "🎈 Receive");
                 ui.horizontal(|ui| {
@@ -1421,6 +1478,7 @@ impl BalloonApp {
                             status: "overwriting …".into(),
                             current: 0,
                             total: 0,
+                            offer_id: None,
                         };
                     }
                     if ui.button("Keep existing").clicked() {
@@ -1429,6 +1487,7 @@ impl BalloonApp {
                             status: "keeping existing …".into(),
                             current: 0,
                             total: 0,
+                            offer_id: None,
                         };
                     }
                 });
@@ -1556,6 +1615,7 @@ impl BalloonApp {
                             }
                             if dirty {
                                 let _ = self.address_book.save();
+                                self.sync_contacts();
                             }
                         });
                 }
@@ -1627,6 +1687,7 @@ impl BalloonApp {
                                 };
                                 self.address_book.contacts.push(contact);
                                 let _ = self.address_book.save();
+                                self.sync_contacts();
                                 self.state = UiState::AddressBook;
                             }
                             Err(e) => {
@@ -1737,13 +1798,13 @@ impl BalloonApp {
                 }
             }
             UiState::IncomingOffer {
+                id,
                 from_short,
                 contact_name,
                 name,
                 size,
                 kind,
                 mime,
-                ticket,
             } => {
                 self.title_bar(ui, ctx, "📥 Incoming transfer");
                 match &contact_name {
@@ -1780,32 +1841,197 @@ impl BalloonApp {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("✔ Accept").clicked() {
-                        if let Some(r) = self.pending_offer_respond.take() {
-                            let _ = r.send(true);
-                        }
-                        let result_tx = self.pending_offer_result.take();
+                        // The worker resolves the save folder (configured
+                        // default or a picker) and asks the manager to start
+                        // the receive. The manager holds the ticket/channels.
                         if self.config.default_folder().is_some() {
                             self.state = UiState::Receiving {
                                 status: "connecting ...".into(),
                                 current: 0,
                                 total: 0,
+                                offer_id: Some(id),
                             };
-                            self.send_cmd(Command::ReceiveOffer { ticket, result_tx });
+                            self.send_cmd(Command::AcceptOffer { id });
                         } else {
                             self.state = UiState::PickingFolder;
                             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-                            self.send_cmd(Command::ReceiveOffer { ticket, result_tx });
+                            self.send_cmd(Command::AcceptOffer { id });
                         }
                     }
                     if ui.button("✘ Decline").clicked() {
-                        if let Some(r) = self.pending_offer_respond.take() {
-                            let _ = r.send(false);
-                        }
-                        self.pending_offer_result.take();
+                        self.send_cmd(Command::DeclineOffer { id });
                         self.state = UiState::Idle;
                     }
                 });
             }
+            UiState::Activity => {
+                self.draw_activity(ui, ctx);
+            }
+        }
+    }
+
+    /// Draw the Activity panel: block-mode toggle, active transfers, queued
+    /// offers, and the recent event log. Reads from the shared
+    /// [`TransfersSnapshot`] each frame.
+    fn draw_activity(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.title_bar(ui, ctx, "📋 Activity");
+
+        // Block-mode toggle
+        let mut block = self.block_mode;
+        ui.checkbox(&mut block, "Block all incoming offers")
+            .on_hover_text(
+                "When on, every new offer is rejected immediately. \
+                 Already-running and already-queued transfers are unaffected.",
+            );
+        if block != self.block_mode {
+            self.block_mode = block;
+            self.send_cmd(Command::SetBlockMode(block));
+        }
+        if block {
+            ui.colored_label(
+                Color32::from_rgb(230, 90, 90),
+                "🚫 Blocking — new offers will be rejected.",
+            );
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        let snap = self.snapshot.lock().unwrap().clone();
+
+        // Active transfers
+        ui.label(RichText::new(format!("Active ({})", snap.active.len())).strong());
+        ui.add_space(2.0);
+        if snap.active.is_empty() {
+            ui.label(RichText::new("no active transfers").weak());
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    for t in &snap.active {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("📥").size(14.0));
+                            ui.label(RichText::new(&t.name).strong());
+                            ui.label(
+                                RichText::new(format!(
+                                    "from {}",
+                                    t.contact_name.as_deref().unwrap_or(&t.from_short)
+                                ))
+                                .weak()
+                                .size(10.0),
+                            );
+                            ui.label(
+                                RichText::new(HumanBytes(t.size).to_string())
+                                    .weak()
+                                    .size(10.0),
+                            );
+                            ui.label(
+                                RichText::new(if t.lane == sendme::transfers::Lane::Auto {
+                                    "auto"
+                                } else {
+                                    "interactive"
+                                })
+                                .weak()
+                                .size(10.0),
+                            );
+                            if ui.small_button("✕").on_hover_text("cancel").clicked() {
+                                self.send_cmd(Command::CancelTransfer { id: t.id });
+                            }
+                        });
+                    }
+                });
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Queued offers
+        ui.label(RichText::new(format!("Queued ({})", snap.queued.len())).strong());
+        ui.add_space(2.0);
+        if snap.queued.is_empty() {
+            ui.label(RichText::new("queue is empty").weak());
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    for q in &snap.queued {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{}.", q.position + 1))
+                                    .weak()
+                                    .size(10.0),
+                            );
+                            ui.label(RichText::new(&q.name).strong());
+                            ui.label(
+                                RichText::new(format!(
+                                    "from {}",
+                                    q.contact_name.as_deref().unwrap_or(&q.from_short)
+                                ))
+                                .weak()
+                                .size(10.0),
+                            );
+                            ui.label(
+                                RichText::new(HumanBytes(q.size).to_string())
+                                    .weak()
+                                    .size(10.0),
+                            );
+                            ui.label(
+                                RichText::new(if q.lane == sendme::transfers::Lane::Auto {
+                                    "auto"
+                                } else {
+                                    "interactive"
+                                })
+                                .weak()
+                                .size(10.0),
+                            );
+                        });
+                    }
+                });
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Event log (most recent first)
+        ui.label(RichText::new("Recent activity").strong());
+        ui.add_space(2.0);
+        if snap.log.is_empty() {
+            ui.label(RichText::new("nothing logged yet").weak());
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for entry in snap.log.iter().rev() {
+                        let elapsed = entry.ts.elapsed();
+                        let ts = if elapsed.as_secs() < 60 {
+                            format!("{}s ago", elapsed.as_secs())
+                        } else {
+                            format!("{}m ago", elapsed.as_secs() / 60)
+                        };
+                        let icon = match entry.kind {
+                            sendme::transfers::EventKind::Queued => "⏳",
+                            sendme::transfers::EventKind::Started => "▶",
+                            sendme::transfers::EventKind::Completed => "✅",
+                            sendme::transfers::EventKind::KeptExisting => "⚠",
+                            sendme::transfers::EventKind::Failed => "❌",
+                            sendme::transfers::EventKind::Cancelled => "⊘",
+                            sendme::transfers::EventKind::Blocked => "🚫",
+                            sendme::transfers::EventKind::Halted => "⛔",
+                            sendme::transfers::EventKind::Declined => "👎",
+                            sendme::transfers::EventKind::Prompted => "🔔",
+                            sendme::transfers::EventKind::Unblock => "🔓",
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(ts).weak().size(10.0));
+                            ui.label(icon);
+                            ui.label(&entry.message);
+                        });
+                    }
+                });
+        }
+        ui.add_space(8.0);
+        if ui.button("Back").clicked() {
+            self.state = UiState::Idle;
         }
     }
 }
@@ -1923,71 +2149,133 @@ fn start_send(
     });
 }
 
-/// Kick off a receive after a save folder has been chosen.
+/// Kick off a manual (pasted-ticket) receive. Forwards progress events to
+/// the GUI's `Receiving` UI and returns the task handle so the worker can
+/// abort it on `CancelReceive`. Shares `export_lock` with any concurrent
+/// managed receives so two transfers cannot race for the same filename.
+/// `endpoint` is the shared receive endpoint (created once in the worker).
 #[allow(clippy::too_many_arguments)]
 fn start_receive(
+    endpoint: iroh::Endpoint,
     ticket: BlobTicket,
     dir: PathBuf,
-    recv_task: &mut Option<tokio::task::JoinHandle<()>>,
-    evt_tx: &std_mpsc::Sender<UiEvent>,
-    ctx: &egui::Context,
-    decision_rx: oneshot::Receiver<OverwriteDecision>,
-    result_tx: Option<oneshot::Sender<TransferResult>>,
+    evt_tx: std_mpsc::Sender<UiEvent>,
+    ctx: egui::Context,
+    conflict: ConflictResolver,
+    export_lock: Arc<TokioMutex<()>>,
     config: Arc<Config>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let _ = evt_tx.send(UiEvent::ReceiveStarting);
     ctx.request_repaint();
     let (re_tx, mut re_rx) = tokio_mpsc::channel(64);
-    *recv_task = Some(tokio::spawn(receive_ticket(
+    let handle = tokio::spawn(receive_ticket(
+        endpoint,
         ticket,
         dir,
         re_tx,
-        decision_rx,
+        conflict,
+        export_lock,
         (*config).clone(),
-    )));
-    let evt_tx = evt_tx.clone();
-    let ctx = ctx.clone();
+    ));
+    let evt_tx2 = evt_tx.clone();
+    let ctx2 = ctx.clone();
     tokio::spawn(async move {
-        let mut result_tx = result_tx;
         while let Some(e) = re_rx.recv().await {
-            // Intercept the terminal receive events to report the outcome
-            // back to the sender (via the offer stream). Only sent once.
-            match &e {
-                ReceiveEvent::Completed { .. } => {
-                    if let Some(tx) = result_tx.take() {
-                        let _ = tx.send(TransferResult::Saved);
-                    }
-                }
-                ReceiveEvent::KeptExisting { .. } => {
-                    if let Some(tx) = result_tx.take() {
-                        let _ = tx.send(TransferResult::KeptExisting);
-                    }
-                }
-                ReceiveEvent::Error(_) => {
-                    // Dropping result_tx makes the accept loop send RESULT_ERROR.
-                    result_tx.take();
-                }
-                ReceiveEvent::SenderCancelled => {
-                    // The sender already gave up, but drop the channel so the
-                    // accept loop does not hang waiting for a result.
-                    result_tx.take();
-                }
-                _ => {}
-            }
-            let _ = evt_tx.send(UiEvent::Receive(e));
-            ctx.request_repaint();
+            let _ = evt_tx2.send(UiEvent::Receive(e));
+            ctx2.request_repaint();
         }
     });
+    handle
+}
+
+/// Spawn a managed (offer-driven) receive. Reports the terminal outcome back
+/// to the transfer manager via `done_tx` so the manager can send the
+/// `TransferResult` to the sender and drain the queue. When `lane` is
+/// `Interactive`, progress events also drive the GUI's `Receiving` UI; for the
+/// `Auto` lane they are consumed silently (the snapshot tracks activity —
+/// Phase 2 renders it).
+#[allow(clippy::too_many_arguments)]
+fn spawn_managed_receive(
+    endpoint: iroh::Endpoint,
+    params: ReceiveParams,
+    lane: sendme::transfers::Lane,
+    conflict: ConflictResolver,
+    export_lock: Arc<TokioMutex<()>>,
+    config: Arc<Config>,
+    evt_tx: std_mpsc::Sender<UiEvent>,
+    ctx: egui::Context,
+    done_tx: tokio_mpsc::Sender<(OfferId, CompletionOutcome)>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let ticket = match parse_ticket(&params.ticket) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = done_tx.try_send((params.id, CompletionOutcome::Failed(e.to_string())));
+            return None;
+        }
+    };
+    // Disk-space guard: refuse to start a transfer that cannot fit on the
+    // target filesystem. When `available_space` returns `None` (platform
+    // without the syscall, or a non-existent path) the guard is skipped so
+    // the app degrades gracefully.
+    if let Some(free) = available_space(&params.target_dir) {
+        if free < params.size {
+            let _ = done_tx.try_send((
+                params.id,
+                CompletionOutcome::Failed(format!(
+                    "insufficient disk space: need {}, have {}",
+                    indicatif::HumanBytes(params.size),
+                    indicatif::HumanBytes(free)
+                )),
+            ));
+            return None;
+        }
+    }
+    let (re_tx, mut re_rx) = tokio_mpsc::channel(64);
+    let handle = tokio::spawn(receive_ticket(
+        endpoint,
+        ticket,
+        params.target_dir,
+        re_tx,
+        conflict,
+        export_lock,
+        (*config).clone(),
+    ));
+    let id = params.id;
+    let evt_tx2 = evt_tx.clone();
+    let ctx2 = ctx.clone();
+    tokio::spawn(async move {
+        let mut outcome = CompletionOutcome::Cancelled;
+        while let Some(e) = re_rx.recv().await {
+            match &e {
+                ReceiveEvent::Completed { .. } => outcome = CompletionOutcome::Saved,
+                ReceiveEvent::KeptExisting { .. } => outcome = CompletionOutcome::KeptExisting,
+                ReceiveEvent::Error(msg) => outcome = CompletionOutcome::Failed(msg.clone()),
+                ReceiveEvent::SenderCancelled => outcome = CompletionOutcome::Cancelled,
+                _ => {}
+            }
+            if lane == sendme::transfers::Lane::Interactive {
+                let _ = evt_tx2.send(UiEvent::Receive(e));
+                ctx2.request_repaint();
+            }
+        }
+        let _ = done_tx.send((id, outcome)).await;
+    });
+    Some(handle)
 }
 
 /// The background worker owns the tokio runtime and drives the actual
 /// sendme send/receive operations, plus the persistent contact endpoint used
 /// to exchange transfer-ticket offers between two balloons.
+///
+/// Incoming offers are routed through a [`TransferManager`] (priority queue +
+/// two-lane scheduler) instead of straight to the GUI, so an informational
+/// dialog or an in-progress send no longer causes offers to be rejected.
 fn spawn_worker(
     ctx: egui::Context,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<Command>,
     evt_tx: std_mpsc::Sender<UiEvent>,
     config: Arc<Config>,
+    snapshot: Arc<StdMutex<TransfersSnapshot>>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2000,7 +2288,34 @@ fn spawn_worker(
                 ctx.request_repaint();
             };
 
+            // Serialises the export phase across all concurrent receives so two
+            // transfers cannot race for the same filename. Shared by manual
+            // and managed receives.
+            let export_lock: Arc<TokioMutex<()>> = Arc::new(TokioMutex::new(()));
+
+            // The transfer manager: owns the queue, the active-transfer table
+            // and the event log. Its snapshot is shared with the GUI.
+            let (mgr_evt_tx, mut mgr_evt_rx) = tokio_mpsc::unbounded_channel::<ManagerEvent>();
+            let mut manager = TransferManager::new(config.clone(), snapshot, mgr_evt_tx);
+
+            // Managed-receive tasks report their terminal outcome here.
+            let (done_tx, mut done_rx) =
+                tokio_mpsc::channel::<(OfferId, CompletionOutcome)>(64);
+            // Join handles for managed receives, keyed by offer id (for cancel).
+            let mut tasks: HashMap<OfferId, tokio::task::JoinHandle<()>> = HashMap::new();
+
+            // Conflict decision for managed (offer) receives: resolve
+            // automatically from the config, with "ask" downgraded to
+            // "keep_existing" so an unattended transfer never hangs.
+            let managed_decision = match config.conflict_default {
+                ConflictDefault::Overwrite => OverwriteDecision::Overwrite,
+                ConflictDefault::KeepExisting | ConflictDefault::Ask => {
+                    OverwriteDecision::KeepExisting
+                }
+            };
+
             // persistent contact endpoint for ticket offers
+            let (offer_tx, mut offer_rx) = tokio_mpsc::channel::<sendme::contacts::IncomingOffer>(16);
             let contact_ep = match async {
                 let secret = load_or_create_secret()?;
                 let ep = create_contact_endpoint(secret, config.relay_mode.to_relay_mode()).await?;
@@ -2010,21 +2325,12 @@ fn spawn_worker(
             {
                 Ok(ep) => {
                     emit(UiEvent::NodeIdReady(ep.id().to_string()));
-                    let (offer_tx, mut offer_rx) = tokio_mpsc::channel::<IncomingOffer>(16);
                     tokio::spawn(run_accept_loop(
                         ep.clone(),
                         offer_tx,
                         config.heartbeat_interval(),
                         Duration::from_secs(config.timeouts.offer_conn_close_wait_secs),
                     ));
-                    let evt_tx2 = evt_tx.clone();
-                    let ctx2 = ctx.clone();
-                    tokio::spawn(async move {
-                        while let Some(offer) = offer_rx.recv().await {
-                            let _ = evt_tx2.send(UiEvent::OfferReceived(offer));
-                            ctx2.request_repaint();
-                        }
-                    });
                     Some(ep)
                 }
                 Err(e) => {
@@ -2035,159 +2341,298 @@ fn spawn_worker(
                 }
             };
 
+            // Shared receive endpoint: one iroh endpoint reused for ALL
+            // concurrent receives (manual + managed). Saves N-1 endpoints'
+            // worth of sockets, relay state and magicsocket overhead compared
+            // to creating one per receive. DNS address lookup is always
+            // enabled so tickets with bare node ids resolve correctly.
+            let recv_endpoint = match async {
+                let ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                    .alpns(vec![])
+                    .secret_key(iroh::SecretKey::generate())
+                    .relay_mode(config.relay_mode.to_relay_mode())
+                    .address_lookup(iroh::address_lookup::dns::DnsAddressLookup::n0_dns())
+                    .bind()
+                    .await?;
+                anyhow::Ok(ep)
+            }
+            .await
+            {
+                Ok(ep) => ep,
+                Err(e) => {
+                    emit(UiEvent::OfferError(format!(
+                        "receive endpoint unavailable: {e:#}"
+                    )));
+                    return;
+                }
+            };
+
+            // Single-slot state for MANUAL (pasted-ticket) receives only.
             let mut cancel_send: Option<oneshot::Sender<()>> = None;
-            let mut recv_task: Option<tokio::task::JoinHandle<()>> = None;
-            // Sender used to deliver the user's overwrite decision to a paused
-            // receive task. Filled when a receive starts, drained on resolve.
+            let mut manual_recv_task: Option<tokio::task::JoinHandle<()>> = None;
             let mut conflict_respond: Option<oneshot::Sender<OverwriteDecision>> = None;
-            while let Some(cmd) = cmd_rx.recv().await {
-                match cmd {
-                    Command::PickAndSend => {
-                        let file = rfd::AsyncFileDialog::new()
-                            .set_title("sendme: choose a file to send")
-                            .pick_file()
-                            .await;
-                        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                        match file {
-                            None => emit(UiEvent::FilePickCancelled),
-                            Some(file) => start_send(
-                                file.path().to_path_buf(),
-                                &mut cancel_send,
-                                &evt_tx,
-                                &ctx,
-                                config.clone(),
-                            ),
-                        }
-                    }
-                    Command::SendPath(path) => {
-                        start_send(path, &mut cancel_send, &evt_tx, &ctx, config.clone());
-                    }
-                    Command::SendOffer {
-                        node_id,
-                        ticket,
-                        name,
-                        size,
-                        kind,
-                        mime,
-                    } => match &contact_ep {
-                        Some(ep) => {
-                            let ep = ep.clone();
-                            let evt_tx2 = evt_tx.clone();
-                            let ctx2 = ctx.clone();
-                            tokio::spawn(async move {
-                                let name_for_evt = name.clone();
-                                let evt =
-                                    match send_offer(&ep, node_id, ticket, name, size, kind, mime)
+
+            // Resolve a save folder: configured default, or an async picker.
+            // Returns None when the user cancels the picker.
+            async fn resolve_folder(
+                config: &Config,
+                ctx: &egui::Context,
+            ) -> Option<PathBuf> {
+                if let Some(folder) = config.default_folder() {
+                    return Some(folder.to_path_buf());
+                }
+                let dir = rfd::AsyncFileDialog::new()
+                    .set_title("sendme: choose where to save")
+                    .pick_folder()
+                    .await;
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                dir.map(|d| d.path().to_path_buf())
+            }
+
+            loop {
+                tokio::select! {
+                    Some(cmd) = cmd_rx.recv() => {
+                        match cmd {
+                            Command::PickAndSend => {
+                                let file = rfd::AsyncFileDialog::new()
+                                    .set_title("sendme: choose a file to send")
+                                    .pick_file()
+                                    .await;
+                                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                                match file {
+                                    None => emit(UiEvent::FilePickCancelled),
+                                    Some(file) => start_send(
+                                        file.path().to_path_buf(),
+                                        &mut cancel_send,
+                                        &evt_tx,
+                                        &ctx,
+                                        config.clone(),
+                                    ),
+                                }
+                            }
+                            Command::SendPath(path) => {
+                                start_send(path, &mut cancel_send, &evt_tx, &ctx, config.clone());
+                            }
+                            Command::SendOffer {
+                                node_id, ticket, name, size, kind, mime,
+                            } => match &contact_ep {
+                                Some(ep) => {
+                                    let ep = ep.clone();
+                                    let evt_tx2 = evt_tx.clone();
+                                    let ctx2 = ctx.clone();
+                                    tokio::spawn(async move {
+                                        let name_for_evt = name.clone();
+                                        let evt = match send_offer(
+                                            &ep, node_id, ticket, name, size, kind, mime,
+                                        )
                                         .await
-                                    {
-                                        Ok(OfferResult::Saved) => {
-                                            UiEvent::OfferTransferSaved { name: name_for_evt }
-                                        }
-                                        Ok(OfferResult::KeptExisting) => {
-                                            UiEvent::OfferKeptExisting { name: name_for_evt }
-                                        }
-                                        Ok(OfferResult::Declined) => UiEvent::OfferRejected,
-                                        Err(e) => UiEvent::OfferError(format!("{e:#}")),
-                                    };
-                                let _ = evt_tx2.send(evt);
-                                ctx2.request_repaint();
-                            });
-                        }
-                        None => emit(UiEvent::OfferError("contact endpoint unavailable".into())),
-                    },
-                    Command::CancelSend => {
-                        if let Some(c) = cancel_send.take() {
-                            c.send(()).ok();
-                        }
-                    }
-                    Command::Receive { ticket } => match parse_ticket(&ticket) {
-                        Err(e) => {
-                            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                            emit(UiEvent::TicketInvalid(e.to_string()));
-                        }
-                        Ok(ticket) => {
-                            // Use the configured default folder if set, skipping
-                            // the folder picker; otherwise ask the user.
-                            let target = match config.default_folder() {
-                                Some(folder) => Some(folder.to_path_buf()),
-                                None => {
-                                    let dir = rfd::AsyncFileDialog::new()
-                                        .set_title("sendme: choose where to save")
-                                        .pick_folder()
-                                        .await;
-                                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                                    dir.map(|d| d.path().to_path_buf())
+                                        {
+                                            Ok(OfferResult::Saved) => {
+                                                UiEvent::OfferTransferSaved { name: name_for_evt }
+                                            }
+                                            Ok(OfferResult::KeptExisting) => {
+                                                UiEvent::OfferKeptExisting { name: name_for_evt }
+                                            }
+                                            Ok(OfferResult::Declined) => UiEvent::OfferRejected,
+                                            Ok(OfferResult::Halted) => UiEvent::OfferHalted,
+                                            Err(e) => UiEvent::OfferError(format!("{e:#}")),
+                                        };
+                                        let _ = evt_tx2.send(evt);
+                                        ctx2.request_repaint();
+                                    });
                                 }
-                            };
-                            match target {
-                                None => emit(UiEvent::FolderPickCancelled),
-                                Some(dir) => {
-                                    let (dc_tx, dc_rx) = oneshot::channel();
-                                    conflict_respond = Some(dc_tx);
-                                    start_receive(
-                                        ticket,
-                                        dir,
-                                        &mut recv_task,
-                                        &evt_tx,
-                                        &ctx,
-                                        dc_rx,
-                                        None,
-                                        config.clone(),
-                                    );
+                                None => emit(UiEvent::OfferError("contact endpoint unavailable".into())),
+                            },
+                            Command::CancelSend => {
+                                if let Some(c) = cancel_send.take() {
+                                    c.send(()).ok();
+                                }
+                            }
+                            Command::Receive { ticket } => match parse_ticket(&ticket) {
+                                Err(e) => {
+                                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                                    emit(UiEvent::TicketInvalid(e.to_string()));
+                                }
+                                Ok(ticket) => {
+                                    let target = resolve_folder(&config, &ctx).await;
+                                    match target {
+                                        None => emit(UiEvent::FolderPickCancelled),
+                                        Some(dir) => {
+                                            let (dc_tx, dc_rx) = oneshot::channel();
+                                            conflict_respond = Some(dc_tx);
+                                            manual_recv_task = Some(start_receive(
+                                                recv_endpoint.clone(),
+                                                ticket,
+                                                dir,
+                                                evt_tx.clone(),
+                                                ctx.clone(),
+                                                ConflictResolver::Prompt(dc_rx),
+                                                export_lock.clone(),
+                                                config.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            },
+                            Command::AcceptOffer { id } => {
+                                let target = resolve_folder(&config, &ctx).await;
+                                match target {
+                                    None => {
+                                        // Picker cancelled: decline the offer so
+                                        // the interactive lane is freed.
+                                        if let Some(next) = manager.decline_offer(id).await {
+                                            emit(UiEvent::PromptOffer(next));
+                                        }
+                                        emit(UiEvent::OfferFolderCancelled);
+                                    }
+                                    Some(dir) => {
+                                        if let Some(params) = manager.accept_offer(id, dir).await {
+                                            if let Some(h) = spawn_managed_receive(
+                                                recv_endpoint.clone(),
+                                                params,
+                                                sendme::transfers::Lane::Interactive,
+                                                ConflictResolver::Auto(managed_decision),
+                                                export_lock.clone(),
+                                                config.clone(),
+                                                evt_tx.clone(),
+                                                ctx.clone(),
+                                                done_tx.clone(),
+                                            ) {
+                                                tasks.insert(id, h);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Command::DeclineOffer { id } => {
+                                if let Some(next) = manager.decline_offer(id).await {
+                                    emit(UiEvent::PromptOffer(next));
+                                }
+                            }
+                            Command::CancelTransfer { id } => {
+                                let kind = manager.cancel(id).await;
+                                if kind == CancelKind::Active {
+                                    if let Some(h) = tasks.remove(&id) {
+                                        h.abort();
+                                    }
+                                    let drain = manager
+                                        .on_complete(id, CompletionOutcome::Cancelled)
+                                        .await;
+                                    apply_drain(drain, &mut tasks, &recv_endpoint, &export_lock, &config,
+                                                 &evt_tx, &ctx, &done_tx, &emit).await;
+                                }
+                            }
+                            Command::SetBlockMode(on) => {
+                                manager.set_block_mode(on);
+                            }
+                            Command::UpdateContacts(idx) => {
+                                manager.update_contacts(idx);
+                            }
+                            Command::CancelReceive => {
+                                if let Some(task) = manual_recv_task.take() {
+                                    task.abort();
+                                }
+                            }
+                            Command::ResolveConflict(decision) => {
+                                if let Some(tx) = conflict_respond.take() {
+                                    let _ = tx.send(decision);
                                 }
                             }
                         }
-                    },
-                    Command::ReceiveOffer { ticket, result_tx } => match parse_ticket(&ticket) {
-                        Err(e) => {
-                            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                            emit(UiEvent::TicketInvalid(e.to_string()));
-                        }
-                        Ok(ticket) => {
-                            let target = match config.default_folder() {
-                                Some(folder) => Some(folder.to_path_buf()),
-                                None => {
-                                    let dir = rfd::AsyncFileDialog::new()
-                                        .set_title("sendme: choose where to save")
-                                        .pick_folder()
-                                        .await;
-                                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                                    dir.map(|d| d.path().to_path_buf())
-                                }
-                            };
-                            match target {
-                                None => emit(UiEvent::OfferFolderCancelled),
-                                Some(dir) => {
-                                    let (dc_tx, dc_rx) = oneshot::channel();
-                                    conflict_respond = Some(dc_tx);
-                                    start_receive(
-                                        ticket,
-                                        dir,
-                                        &mut recv_task,
-                                        &evt_tx,
-                                        &ctx,
-                                        dc_rx,
-                                        result_tx,
-                                        config.clone(),
-                                    );
-                                }
-                            }
-                        }
-                    },
-                    Command::CancelReceive => {
-                        if let Some(task) = recv_task.take() {
-                            task.abort();
-                        }
                     }
-                    Command::ResolveConflict(decision) => {
-                        if let Some(tx) = conflict_respond.take() {
-                            let _ = tx.send(decision);
+                    Some(offer) = offer_rx.recv() => {
+                        let dispatch = manager.submit_offer(offer).await;
+                        apply_dispatch(dispatch, &mut tasks, &recv_endpoint, &export_lock, &config,
+                                       &evt_tx, &ctx, &done_tx, &emit, managed_decision).await;
+                    }
+                    Some((id, outcome)) = done_rx.recv() => {
+                        tasks.remove(&id);
+                        let drain = manager.on_complete(id, outcome).await;
+                        apply_drain(drain, &mut tasks, &recv_endpoint, &export_lock, &config,
+                                     &evt_tx, &ctx, &done_tx, &emit).await;
+                    }
+                    Some(mgr_evt) = mgr_evt_rx.recv() => {
+                        match mgr_evt {
+                            ManagerEvent::PromptOffer(info) => emit(UiEvent::PromptOffer(info)),
+                            ManagerEvent::BlockModeChanged(b) => emit(UiEvent::BlockModeChanged(b)),
                         }
                     }
                 }
             }
         });
     });
+}
+
+/// Execute an [`OfferDispatch`] returned by [`TransferManager::submit_offer`]:
+/// spawn auto-lane receives or surface an interactive prompt.
+#[allow(clippy::too_many_arguments)]
+async fn apply_dispatch(
+    dispatch: OfferDispatch,
+    tasks: &mut HashMap<OfferId, tokio::task::JoinHandle<()>>,
+    endpoint: &iroh::Endpoint,
+    export_lock: &Arc<TokioMutex<()>>,
+    config: &Arc<Config>,
+    evt_tx: &std_mpsc::Sender<UiEvent>,
+    ctx: &egui::Context,
+    done_tx: &tokio_mpsc::Sender<(OfferId, CompletionOutcome)>,
+    emit: &impl Fn(UiEvent),
+    managed_decision: OverwriteDecision,
+) {
+    match dispatch {
+        OfferDispatch::Done => {}
+        OfferDispatch::StartAuto(params) => {
+            let id = params.id;
+            if let Some(h) = spawn_managed_receive(
+                endpoint.clone(),
+                params,
+                sendme::transfers::Lane::Auto,
+                ConflictResolver::Auto(managed_decision),
+                export_lock.clone(),
+                config.clone(),
+                evt_tx.clone(),
+                ctx.clone(),
+                done_tx.clone(),
+            ) {
+                tasks.insert(id, h);
+            }
+        }
+        OfferDispatch::Prompt(info) => emit(UiEvent::PromptOffer(info)),
+    }
+}
+
+/// Execute [`DrainActions`] returned by [`TransferManager::on_complete`]:
+/// spawn the next auto-lane receives and surface the next interactive prompt.
+#[allow(clippy::too_many_arguments)]
+async fn apply_drain(
+    drain: DrainActions,
+    tasks: &mut HashMap<OfferId, tokio::task::JoinHandle<()>>,
+    endpoint: &iroh::Endpoint,
+    export_lock: &Arc<TokioMutex<()>>,
+    config: &Arc<Config>,
+    evt_tx: &std_mpsc::Sender<UiEvent>,
+    ctx: &egui::Context,
+    done_tx: &tokio_mpsc::Sender<(OfferId, CompletionOutcome)>,
+    emit: &impl Fn(UiEvent),
+) {
+    for params in drain.auto_starts {
+        let id = params.id;
+        if let Some(h) = spawn_managed_receive(
+            endpoint.clone(),
+            params,
+            sendme::transfers::Lane::Auto,
+            ConflictResolver::Auto(OverwriteDecision::KeepExisting),
+            export_lock.clone(),
+            config.clone(),
+            evt_tx.clone(),
+            ctx.clone(),
+            done_tx.clone(),
+        ) {
+            tasks.insert(id, h);
+        }
+    }
+    if let Some(info) = drain.interactive_prompt {
+        emit(UiEvent::PromptOffer(info));
+    }
 }
 
 fn main() -> eframe::Result {
@@ -2275,15 +2720,14 @@ mod tests {
                 node_id: String::new(),
                 address_book: AddressBook::default(),
                 config: Arc::new(Config::default()),
-                pending_offer_respond: None,
-                pending_offer_result: None,
+                snapshot: Arc::new(StdMutex::new(TransfersSnapshot::default())),
+                block_mode: false,
                 add_contact_name: String::new(),
                 add_contact_node_id: String::new(),
                 add_contact_email: String::new(),
                 add_contact_auto_accept: false,
                 autostart_enabled: false,
                 offer_in_progress: false,
-                auto_accepted_active: false,
                 last_send_path: None,
                 last_offer_contact: None,
                 retry_contact: None,
@@ -2291,6 +2735,23 @@ mod tests {
             },
             cmd_rx,
         )
+    }
+
+    /// Build an `OfferInfo` for a real node id (the manager surfaces these to
+    /// the GUI via `UiEvent::PromptOffer`).
+    fn make_offer_info(from: &iroh::SecretKey, name: &str) -> OfferInfo {
+        let id = from.public();
+        OfferInfo {
+            id: 1,
+            from: id.to_string(),
+            from_short: id.fmt_short().to_string(),
+            contact_name: None,
+            name: name.to_string(),
+            size: 42,
+            kind: FileKind::File,
+            mime: "image/png".to_string(),
+            ticket: "tk".to_string(),
+        }
     }
 
     #[test]
@@ -2394,58 +2855,50 @@ mod tests {
         );
     }
 
+    /// The headline behavioural fix: an incoming offer prompt is NO LONGER
+    /// rejected just because the UI is busy (here, mid-send). The manager
+    /// decides when to prompt, so the prompt surfaces regardless of state.
     #[test]
-    fn incoming_offer_while_busy_is_declined() {
+    fn prompt_offer_surfaces_even_while_sending() {
         let (mut app, _cmds) = app_in_state(UiState::Waiting {
             ticket: "t".into(),
-            name: "n".into(),
+            name: "my-send.txt".into(),
             size: 1,
             kind: FileKind::File,
             mime: "".into(),
             peer: false,
             sent: 0,
         });
-        let (tx, rx) = oneshot::channel();
-        let (rtx, _rrx) = oneshot::channel();
-        let offer = IncomingOffer {
-            from: "f".into(),
-            from_short: "f".into(),
-            name: "n".into(),
-            size: 1,
-            kind: FileKind::File,
-            mime: "".into(),
-            ticket: "t".into(),
-            respond: tx,
-            result_tx: rtx,
-        };
-        app.apply(UiEvent::OfferReceived(offer));
-        // busy -> declined, state unchanged
-        assert!(matches!(app.state, UiState::Waiting { .. }));
-        assert_eq!(rx.blocking_recv(), Ok(false));
+        let key = iroh::SecretKey::generate();
+        let info = make_offer_info(&key, "their-pic.png");
+        app.apply(UiEvent::PromptOffer(info));
+        // The prompt takes over — it is NOT declined because we are sending.
+        assert!(matches!(app.state, UiState::IncomingOffer { .. }));
     }
 
     #[test]
-    fn incoming_offer_when_idle_prompts_user() {
-        let (mut app, _cmds) = app_in_state(UiState::Idle);
-        let (tx, rx) = oneshot::channel();
-        let (rtx, _rrx) = oneshot::channel();
-        let offer = IncomingOffer {
-            from: "f".into(),
-            from_short: "f".into(),
-            name: "pic.png".into(),
-            size: 42,
-            kind: FileKind::File,
-            mime: "image/png".into(),
-            ticket: "tk".into(),
-            respond: tx,
-            result_tx: rtx,
-        };
-        app.apply(UiEvent::OfferReceived(offer));
+    fn declining_a_prompt_sends_decline_command() {
+        let (mut app, mut cmds) = app_in_state(UiState::Idle);
+        let key = iroh::SecretKey::generate();
+        let info = make_offer_info(&key, "pic.png");
+        let id = info.id;
+        app.apply(UiEvent::PromptOffer(info));
         assert!(matches!(app.state, UiState::IncomingOffer { .. }));
-        // simulate the user declining via close_operation
+        // close_operation on the prompt declines it via the manager.
         app.close_operation();
         assert!(matches!(app.state, UiState::Idle));
-        assert!(rx.blocking_recv().is_err());
+        assert!(matches!(cmds.try_recv(), Ok(Command::DeclineOffer { .. })));
+        let _ = id;
+    }
+
+    #[test]
+    fn block_mode_changed_event_updates_mirror() {
+        let (mut app, _cmds) = app_in_state(UiState::Idle);
+        assert!(!app.block_mode);
+        app.apply(UiEvent::BlockModeChanged(true));
+        assert!(app.block_mode);
+        app.apply(UiEvent::BlockModeChanged(false));
+        assert!(!app.block_mode);
     }
 
     #[test]
@@ -2514,6 +2967,7 @@ mod tests {
             status: "downloading ...".into(),
             current: 100,
             total: 1000,
+            offer_id: None,
         });
         app.apply(UiEvent::Receive(ReceiveEvent::SenderCancelled));
         match &app.state {
@@ -2533,106 +2987,45 @@ mod tests {
         assert!(matches!(app.state, UiState::Idle));
     }
 
-    /// Helper: build an IncomingOffer for a real node id, with throwaway
-    /// reply channels.
-    fn make_offer(from: &str) -> IncomingOffer {
-        let (respond, _rx) = oneshot::channel();
-        let (result_tx, _rx) = oneshot::channel();
-        IncomingOffer {
-            from: from.to_string(),
-            from_short: "short".into(),
-            name: "pic.png".into(),
-            size: 42,
-            kind: FileKind::File,
-            mime: "image/png".into(),
-            ticket: "tk".into(),
-            respond,
-            result_tx,
-        }
-    }
-
-    fn with_default_folder(app: &mut BalloonApp, folder: &str) {
-        let cfg = Config {
-            default_save_folder: Some(PathBuf::from(folder)),
-            ..Config::default()
-        };
-        app.config = Arc::new(cfg);
-    }
-
     #[test]
-    fn auto_accept_ignored_without_default_folder_even_if_contact_opted_in() {
-        use iroh::SecretKey;
-        let key = SecretKey::generate();
-        let id_str = key.public().to_string();
-        let offer = make_offer(&id_str);
-        let (mut app, _cmds) = app_in_state(UiState::Idle);
-        app.address_book.contacts.push(Contact {
-            name: "alice".into(),
-            node_id: id_str,
-            email: String::new(),
-            auto_accept: true,
+    fn cancelling_managed_receive_sends_cancel_transfer() {
+        // A managed (offer-driven) receive carries an offer_id. Cancelling it
+        // must send CancelTransfer (which aborts the task in the `tasks` map),
+        // NOT CancelReceive (which only looks at `manual_recv_task`).
+        let (mut app, mut cmds) = app_in_state(UiState::Receiving {
+            status: "downloading ...".into(),
+            current: 100,
+            total: 1000,
+            offer_id: Some(42),
         });
-        // contact opted in, but no default folder -> cannot auto-accept
-        assert!(!app.should_auto_accept(&offer));
+        app.close_operation();
+        assert!(matches!(app.state, UiState::Idle));
+        assert!(
+            matches!(cmds.try_recv(), Ok(Command::CancelTransfer { id: 42 })),
+            "expected CancelTransfer for managed receive"
+        );
     }
 
     #[test]
-    fn auto_accept_fires_for_opted_in_contact_when_folder_set() {
-        use iroh::SecretKey;
-        let key = SecretKey::generate();
-        let id_str = key.public().to_string();
-        let offer = make_offer(&id_str);
-        let (mut app, _cmds) = app_in_state(UiState::Idle);
-        app.address_book.contacts.push(Contact {
-            name: "alice".into(),
-            node_id: id_str.clone(),
-            email: "alice@example.com".into(),
-            auto_accept: true,
+    fn cancelling_manual_receive_sends_cancel_receive() {
+        // A manual (pasted-ticket) receive has offer_id=None. Cancelling it
+        // sends CancelReceive (which aborts `manual_recv_task`).
+        let (mut app, mut cmds) = app_in_state(UiState::Receiving {
+            status: "downloading ...".into(),
+            current: 100,
+            total: 1000,
+            offer_id: None,
         });
-        with_default_folder(&mut app, "/tmp/sendme");
-        assert!(app.should_auto_accept(&offer));
+        app.close_operation();
+        assert!(matches!(app.state, UiState::Idle));
+        assert!(
+            matches!(cmds.try_recv(), Ok(Command::CancelReceive)),
+            "expected CancelReceive for manual receive"
+        );
     }
 
-    #[test]
-    fn global_auto_accept_applies_to_unknown_senders_only_with_folder() {
-        use iroh::SecretKey;
-        let key = SecretKey::generate();
-        let id_str = key.public().to_string(); // not in the address book
-        let offer = make_offer(&id_str);
-        let (mut app, _cmds) = app_in_state(UiState::Idle);
-        // global on, no folder -> ignored
-        let cfg = Config {
-            auto_accept_offers: true,
-            ..Config::default()
-        };
-        app.config = Arc::new(cfg);
-        assert!(!app.should_auto_accept(&offer));
-        // folder set -> now accepts even unknown senders
-        with_default_folder(&mut app, "/tmp/sendme");
-        // with_default_folder resets auto_accept_offers to false, so set again
-        let cfg = Config {
-            auto_accept_offers: true,
-            default_save_folder: Some(PathBuf::from("/tmp/sendme")),
-            ..Config::default()
-        };
-        app.config = Arc::new(cfg);
-        assert!(app.should_auto_accept(&offer));
-    }
-
-    #[test]
-    fn auto_accept_off_for_normal_contact_when_global_off() {
-        use iroh::SecretKey;
-        let key = SecretKey::generate();
-        let id_str = key.public().to_string();
-        let offer = make_offer(&id_str);
-        let (mut app, _cmds) = app_in_state(UiState::Idle);
-        app.address_book.contacts.push(Contact {
-            name: "bob".into(),
-            node_id: id_str,
-            email: String::new(),
-            auto_accept: false,
-        });
-        with_default_folder(&mut app, "/tmp/sendme");
-        assert!(!app.should_auto_accept(&offer));
-    }
+    // The auto-accept / lane-classification logic that these tests used to
+    // cover now lives in the transfer manager (`src/transfers.rs`), where it is
+    // tested directly — see `transfers::tests::*`. The GUI no longer decides
+    // acceptance, so there is nothing left to assert here.
 }

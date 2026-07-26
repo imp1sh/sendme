@@ -67,7 +67,7 @@ tempfile = "3.8.1"
 
 [features]
 clipboard = ["dep:crossterm", "dep:windows-sys", "dep:libc"]
-balloon = ["dep:eframe", "dep:rfd", "dep:winit", "dep:dirs", "dep:serde_json", "dep:notify-rust", "dep:mime_guess", "dep:serde_yaml"]
+balloon = ["dep:eframe", "dep:rfd", "dep:winit", "dep:dirs", "dep:serde_json", "dep:notify-rust", "dep:mime_guess", "dep:serde_yaml", "dep:libc"]
 default = ["clipboard"]
 
 [[bin]]
