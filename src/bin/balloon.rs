@@ -883,8 +883,7 @@ impl BalloonApp {
                 self.send_cmd(Command::CancelReceive);
             }
             UiState::Receiving {
-                offer_id: Some(id),
-                ..
+                offer_id: Some(id), ..
             } => {
                 self.send_cmd(Command::CancelTransfer { id: *id });
             }
@@ -1053,6 +1052,34 @@ impl BalloonApp {
         );
         if close_resp.clicked() {
             ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+
+        // contacts_only indicator: a small lock icon at the top-left of the
+        // balloon, shown only when the config has contacts_only enabled. It
+        // signals that unknown senders will be silently blocked.
+        if self.config.contacts_only {
+            let lock_pos = Pos2::new(rect.left() + 14.0, rect.top() + 14.0);
+            let lock_resp = ui.interact(
+                Rect::from_center_size(lock_pos, Vec2::splat(20.0)),
+                ui.id().with("contacts_only"),
+                Sense::hover(),
+            );
+            let lock_col = if lock_resp.hovered() {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(160)
+            };
+            ui.painter().text(
+                lock_pos,
+                Align2::CENTER_CENTER,
+                "🔒",
+                FontId::proportional(12.0),
+                lock_col,
+            );
+            lock_resp.on_hover_text(
+                "Contacts-only mode is ON: incoming offers from senders \
+                 not in your address book are silently blocked.",
+            );
         }
 
         let dropped_path = ctx.input(|i| first_dropped_path(&i.raw.dropped_files));

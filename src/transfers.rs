@@ -408,13 +408,11 @@ impl TransferManager {
         }
 
         // contacts_only: reject offers from senders not in the address book.
+        // This is intentionally SILENT — no log entry, no snapshot update, no
+        // UI trace. The sender receives ACK_BLOCK so it knows the offer was
+        // rejected, but the receiver sees nothing.
         if self.config.contacts_only && !is_contact {
             let _ = offer.verdict_tx.send(OfferVerdict::Block).await;
-            self.log(
-                EventKind::Blocked,
-                format!("blocked unknown sender {} (contacts_only)", info.from_short),
-            );
-            self.rebuild_snapshot();
             return OfferDispatch::Done;
         }
 
@@ -1102,7 +1100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contacts_only_blocks_strangers() {
+    async fn contacts_only_blocks_strangers_silently() {
         let cfg = Arc::new(Config {
             contacts_only: true,
             ..(*cfg_with_folder()).clone()
@@ -1111,8 +1109,13 @@ mod tests {
         let stranger = SecretKey::generate();
         let dispatch = mgr.submit_offer(make_offer(&stranger, "spam.bin")).await;
         assert!(matches!(dispatch, OfferDispatch::Done));
+        // Silent: no active, no queued, and crucially no log entry.
         assert!(snap.lock().unwrap().active.is_empty());
         assert!(snap.lock().unwrap().queued.is_empty());
+        assert!(
+            snap.lock().unwrap().log.is_empty(),
+            "contacts_only blocking must be silent — no log entry"
+        );
     }
 
     #[tokio::test]
