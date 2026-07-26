@@ -37,8 +37,24 @@ pub const OFFER_ALPN: &[u8] = b"sendme-balloon/offer/1";
 /// are still accepted by [`decode_offer`] for backward compatibility.
 const OFFER_VERSION: u8 = 2;
 /// Ack byte values exchanged after an offer.
+///
+/// The negotiation phase (phase 1) is now a stream of verdicts rather than a
+/// single boolean: the receiver may send [`ACK_WAIT`] any number of times while
+/// an offer sits in its queue, then a terminal [`ACK_ACCEPT`], [`ACK_BLOCK`] or
+/// [`ACK_HALT`]. The sender keeps reading (skipping heartbeats and waits) until
+/// it sees a terminal verdict.
 const ACK_ACCEPT: u8 = 1;
-const ACK_REJECT: u8 = 0;
+/// Permanent "no" — the receiver declined, is in block mode, or refused by
+/// policy. The sender should not retry the same offer.
+const ACK_BLOCK: u8 = 0;
+/// Transient "busy" — the receiver's queue is full. The sender may retry the
+/// same offer shortly. Distinct from [`ACK_BLOCK`] so the sender can tell
+/// "give up" apart from "try again".
+const ACK_HALT: u8 = 2;
+/// Non-terminal "I have queued you, hold the line". The receiver sends this as
+/// soon as an offer enters its queue; the sender keeps the connection open and
+/// keeps waiting for the terminal verdict.
+const ACK_WAIT: u8 = 6;
 /// Result byte values sent by the receiver after the transfer completes.
 /// Only sent following an ``ACK_ACCEPT``; the stream stays open (with
 /// heartbeats) until the receiver knows the outcome.
@@ -57,12 +73,37 @@ const HEARTBEAT_BYTE: u8 = 0xFE;
 /// transfer attempt finishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OfferResult {
-    /// The contact declined the transfer.
+    /// The contact declined the transfer, or is in block mode / refused by
+    /// policy. The sender should not retry the same offer.
     Declined,
     /// The contact accepted and the file(s) were saved.
     Saved,
     /// The contact accepted but kept existing file(s); nothing was overwritten.
     KeptExisting,
+    /// The receiver was overloaded (its queue was full). The sender may retry
+    /// the same offer shortly. No transfer was attempted.
+    Halted,
+}
+
+/// A verdict the receiver sends to the offering peer during the negotiation
+/// phase. Delivered over the `verdict_tx` channel attached to each
+/// [`IncomingOffer`].
+///
+/// The receiver may send any number of [`Wait`](Self::Wait) verdicts while an
+/// offer sits in its queue, followed by exactly one terminal verdict
+/// ([`Accept`](Self::Accept), [`Block`](Self::Block) or [`Halt`](Self::Halt)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferVerdict {
+    /// Non-terminal: the offer is queued. The receiver keeps the connection
+    /// alive (heartbeating) and will send a terminal verdict later.
+    Wait,
+    /// Terminal: proceeding to fetch the data now.
+    Accept,
+    /// Terminal permanent "no" — declined, block mode, or policy refusal.
+    /// The sender should not retry.
+    Block,
+    /// Terminal transient "busy" — the queue is full. The sender may retry.
+    Halt,
 }
 
 /// The outcome of a receive, sent back to the offering peer via the contact
@@ -241,10 +282,11 @@ pub async fn create_contact_endpoint(
     Ok(endpoint)
 }
 
-/// A ticket offered by a remote peer, handed to the GUI for an accept/decline
-/// decision. `respond` carries the user's answer back to the network task.
-/// `result_tx` is used (only when accepted) to report the transfer outcome
-/// back to the sender over the same offer stream.
+/// A ticket offered by a remote peer, handed off to the transfer manager for a
+/// queue/accept decision. `verdict_tx` carries the receiver's verdicts back to
+/// the network task (the per-connection task that writes the ack bytes to the
+/// peer). `result_tx` is used (only after an `Accept` verdict) to report the
+/// transfer outcome back to the sender over the same offer stream.
 #[derive(Debug)]
 pub struct IncomingOffer {
     /// Canonical string form of the sender's [`EndpointId`].
@@ -261,10 +303,13 @@ pub struct IncomingOffer {
     pub mime: String,
     /// The transfer ticket the receiver should fetch from.
     pub ticket: String,
-    /// Channel to report the user's accept (true) / decline (false) decision.
-    pub respond: oneshot::Sender<bool>,
-    /// Channel to report the transfer outcome (only used when accepted).
-    /// Dropped without sending if the user declines.
+    /// Channel to report the receiver's verdicts. The manager may send any
+    /// number of [`OfferVerdict::Wait`] values while the offer is queued,
+    /// then exactly one terminal verdict ([`OfferVerdict::Accept`],
+    /// [`OfferVerdict::Block`] or [`OfferVerdict::Halt`]).
+    pub verdict_tx: mpsc::Sender<OfferVerdict>,
+    /// Channel to report the transfer outcome (only used after `Accept`).
+    /// Dropped without sending if the offer is blocked or halted.
     pub result_tx: oneshot::Sender<TransferResult>,
 }
 
@@ -369,16 +414,17 @@ pub fn decode_offer(buf: &[u8]) -> anyhow::Result<DecodedOffer> {
     })
 }
 
-/// Send a ticket offer to `node_id` and wait for the peer's accept/decline
-/// answer, then (if accepted) for the transfer result.
+/// Send a ticket offer to `node_id` and wait for the peer's verdict, then
+/// (if accepted) for the transfer result.
 ///
-/// Returns [`OfferResult::Declined`] if the peer declines, or
-/// [`OfferResult::Saved`] / [`OfferResult::KeptExisting`] once the receiver
-/// reports the outcome of the transfer.
-///
-/// The peer sends periodic [`HEARTBEAT_BYTE`]s while its user is still
-/// deciding and while the transfer is in progress; those are skipped here so
-/// we only return on the final verdict and result.
+/// The negotiation phase is a stream: the receiver may send any number of
+/// [`ACK_WAIT`] bytes while the offer sits in its queue, then a terminal
+/// [`ACK_ACCEPT`], [`ACK_BLOCK`] or [`ACK_HALT`]. Heartbeats are skipped
+/// throughout. Returns:
+/// - [`OfferResult::Declined`] on `ACK_BLOCK` (permanent no — do not retry),
+/// - [`OfferResult::Halted`] on `ACK_HALT` (transient overload — retry shortly),
+/// - [`OfferResult::Saved`] / [`OfferResult::KeptExisting`] once the receiver
+///   reports the outcome of the transfer (after `ACK_ACCEPT`).
 pub async fn send_offer(
     endpoint: &Endpoint,
     node_id: EndpointId,
@@ -402,16 +448,17 @@ pub async fn send_offer(
         .map_err(|e| anyhow::anyhow!("sending offer: {e}"))?;
     send.finish()
         .map_err(|e| anyhow::anyhow!("finishing send stream: {e}"))?;
-    // Phase 1 — wait for the accept/decline ack (skipping heartbeats).
+    // Phase 1 — wait for the terminal verdict (skipping heartbeats and waits).
     loop {
         let mut byte = [0u8; 1];
         recv.read_exact(&mut byte)
             .await
             .map_err(|e| anyhow::anyhow!("reading reply: {e}"))?;
         match byte[0] {
-            HEARTBEAT_BYTE => continue,
+            HEARTBEAT_BYTE | ACK_WAIT => continue,
             ACK_ACCEPT => break, // accepted — proceed to phase 2
-            ACK_REJECT => return Ok(OfferResult::Declined),
+            ACK_BLOCK => return Ok(OfferResult::Declined),
+            ACK_HALT => return Ok(OfferResult::Halted),
             other => anyhow::bail!("unexpected reply byte: 0x{other:02x}"),
         }
     }
@@ -433,15 +480,17 @@ pub async fn send_offer(
 
 /// Run the inbound offer loop for the lifetime of `endpoint`.
 ///
-/// For each incoming connection the offer is decoded and forwarded to the GUI
-/// through `offer_tx` as an [`IncomingOffer`] (which carries a oneshot the GUI
-/// uses to report the accept/decline decision). The per-connection task then
-/// awaits that decision and writes the matching ack byte back to the peer.
+/// For each incoming connection the offer is decoded and forwarded through
+/// `offer_tx` as an [`IncomingOffer`] (which carries a `verdict_tx` channel the
+/// transfer manager uses to report its verdicts). The per-connection task then
+/// awaits those verdicts and writes the matching ack bytes back to the peer:
+/// any number of [`ACK_WAIT`] while the offer is queued, then a terminal
+/// [`ACK_ACCEPT`], [`ACK_BLOCK`] or [`ACK_HALT`].
 ///
-/// `heartbeat_interval` replaces the historic fixed [`HEARTBEAT_INTERVAL`] so
-/// the cadence is configurable; `conn_close_wait` bounds how long the task
-/// waits for the sender to acknowledge the reply before dropping the
-/// connection.
+/// `heartbeat_interval` is the cadence at which heartbeats keep the QUIC
+/// connection alive while the offer sits in the receiver's queue; `conn_close_wait`
+/// bounds how long the task waits for the sender to acknowledge the reply
+/// before dropping the connection.
 pub async fn run_accept_loop(
     endpoint: Endpoint,
     offer_tx: mpsc::Sender<IncomingOffer>,
@@ -494,7 +543,7 @@ pub async fn run_accept_loop(
                     return;
                 }
             };
-            let (resp_tx, mut resp_rx) = oneshot::channel();
+            let (verdict_tx, mut verdict_rx) = mpsc::channel(8);
             let (result_tx, mut result_rx) = oneshot::channel();
             let offer = IncomingOffer {
                 from: from_full,
@@ -504,19 +553,23 @@ pub async fn run_accept_loop(
                 kind: decoded.kind,
                 mime: decoded.mime,
                 ticket: decoded.ticket,
-                respond: resp_tx,
+                verdict_tx,
                 result_tx,
             };
             if offer_tx.send(offer).await.is_err() {
-                // GUI gone: decline so the sender does not hang.
-                let _ = send.write_all(&[ACK_REJECT]).await;
+                // Manager gone: block so the sender does not hang.
+                let _ = send.write_all(&[ACK_BLOCK]).await;
                 let _ = send.finish();
                 return;
             }
-            // Send heartbeats while the remote user decides. The peer skips
-            // these bytes and waits for the final accept/decline. Periodic
-            // data on the stream resets the QUIC idle timer on both sides,
-            // keeping the connection alive across a multi-minute human pause.
+            // Send heartbeats while the manager deliberates. The peer skips
+            // these bytes and waits for the terminal verdict. Periodic data on
+            // the stream resets the QUIC idle timer on both sides, keeping the
+            // connection alive across what may be a multi-minute queue wait.
+            //
+            // The manager may send any number of `Wait` verdicts (each flushed
+            // to the peer as `ACK_WAIT`) before the terminal `Accept`/`Block`/
+            // `Halt`.
             let accepted = loop {
                 tokio::select! {
                     _ = tokio::time::sleep(heartbeat_interval) => {
@@ -524,14 +577,20 @@ pub async fn run_accept_loop(
                             break false;
                         }
                     }
-                    accepted = &mut resp_rx => {
-                        let is_accepted = accepted.unwrap_or(false);
-                        let ack = if is_accepted { ACK_ACCEPT } else { ACK_REJECT };
-                        let _ = send.write_all(&[ack]).await;
-                        if !is_accepted {
+                    verdict = verdict_rx.recv() => {
+                        let (byte, terminal, accepted) = match verdict {
+                            Some(OfferVerdict::Wait) => (ACK_WAIT, false, false),
+                            Some(OfferVerdict::Accept) => (ACK_ACCEPT, true, true),
+                            Some(OfferVerdict::Block) | None => (ACK_BLOCK, true, false),
+                            Some(OfferVerdict::Halt) => (ACK_HALT, true, false),
+                        };
+                        let _ = send.write_all(&[byte]).await;
+                        if terminal && !accepted {
                             let _ = send.finish();
                         }
-                        break is_accepted;
+                        if terminal {
+                            break accepted;
+                        }
                     }
                 }
             };
