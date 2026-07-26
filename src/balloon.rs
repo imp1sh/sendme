@@ -672,8 +672,8 @@ pub fn available_space(path: &std::path::Path) -> Option<u64> {
             return None;
         }
         // frsize * bavail gives the actual free bytes available to us.
-        let frsize = statv.f_frsize as u64;
-        let bavail = statv.f_bavail as u64;
+        let frsize = statv.f_frsize;
+        let bavail = statv.f_bavail;
         Some(frsize.saturating_mul(bavail))
     }
     #[cfg(not(unix))]
