@@ -32,6 +32,46 @@
 
 # ── Incoming transfers ──────────────────────────────────────────────────────
 
+# Maximum number of incoming transfers that may download IN PARALLEL. Each
+# parallel receive opens its own iroh endpoint, QUIC connection and temp blob
+# store, so this trades throughput for resource use. Additional offers queue
+# (see `max_queue_depth` below) and start as slots free up. The queue is
+# drained FIFO, with contacts in the address book served before unknown senders
+# when `strict_contact_priority` is on.
+#
+# default: 3
+# max_concurrent_receives: 3
+
+# Maximum number of offers held waiting in the queue. An offer arriving beyond
+# this is rejected with a "busy, retry shortly" signal so the sender backs off
+# instead of piling onto an overloaded receiver. Already-running and
+# already-queued transfers are unaffected.
+#
+# default: 8
+# max_queue_depth: 8
+
+# When true (the default), offers from contacts in the address book are served
+# before offers from unknown senders, regardless of arrival order. Set false
+# for a pure FIFO queue where everyone is equal.
+#
+# default: true
+# strict_contact_priority: true
+
+# Reject offers from senders NOT in the address book. When true, unknown
+# senders are hard-blocked immediately; only contacts can push files to you.
+# When false (the default), strangers queue at lowest priority and are
+# prompted like anyone else.
+#
+# default: false
+# contacts_only: false
+
+# Start the app in block mode, where every incoming offer is rejected
+# immediately. Useful as a "do not disturb" startup state; the mode can be
+# toggled at runtime from the UI (Phase 2). Already-running transfers continue.
+#
+# default: false
+# block_mode: false
+
 # Default folder for incoming transfers. When set, the folder-picker dialog is
 # SKIPPED and every incoming file lands here — for manual "paste a ticket"
 # receives as well as for transfers pushed by a contact.

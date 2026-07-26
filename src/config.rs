@@ -217,6 +217,50 @@ pub struct Config {
     #[serde(default)]
     pub notifications: NotificationConfig,
 
+    /// Maximum number of incoming transfers that may download in parallel.
+    ///
+    /// Each parallel receive opens its own iroh endpoint, QUIC connection and
+    /// temp blob store, so this trades throughput for resource use. Additional
+    /// offers queue (see `max_queue_depth`) and start as slots free up.
+    ///
+    /// default: 3
+    #[serde(default = "default_max_concurrent_receives")]
+    pub max_concurrent_receives: usize,
+
+    /// Maximum number of offers held waiting in the queue. An offer arriving
+    /// beyond this is hard-rejected with an `ACK_HALT` ("busy, retry shortly")
+    /// so the sender backs off instead of piling onto an overloaded receiver.
+    ///
+    /// default: 8
+    #[serde(default = "default_max_queue_depth")]
+    pub max_queue_depth: usize,
+
+    /// When `true` (the default), offers from contacts in the address book are
+    /// served before offers from unknown senders, regardless of arrival order.
+    /// Set `false` for a pure FIFO queue where everyone is equal.
+    ///
+    /// default: true
+    #[serde(default = "default_strict_contact_priority")]
+    pub strict_contact_priority: bool,
+
+    /// Reject offers from senders NOT in the address book. When `true`,
+    /// unknown senders are hard-blocked immediately; only contacts can push
+    /// files to you. When `false` (the default), strangers queue at lowest
+    /// priority and are prompted like anyone else.
+    ///
+    /// default: false
+    #[serde(default)]
+    pub contacts_only: bool,
+
+    /// Initial acceptance mode. `false` (the default) starts in **accept**
+    /// mode: incoming offers are queued and served. `true` starts in
+    /// **block** mode: every incoming offer is rejected immediately. The mode
+    /// can be toggled at runtime from the UI; this only sets the startup value.
+    ///
+    /// default: false
+    #[serde(default)]
+    pub block_mode: bool,
+
     /// Logging level: `error`, `warn`, `info`, `debug`, `trace`.
     /// The `RUST_LOG` environment variable, if set, takes precedence over this.
     #[serde(default = "default_log_level")]
@@ -240,6 +284,11 @@ impl Default for Config {
             chunk_size_mib: default_chunk_size_mib(),
             conflict_default: ConflictDefault::default(),
             notifications: NotificationConfig::default(),
+            max_concurrent_receives: default_max_concurrent_receives(),
+            max_queue_depth: default_max_queue_depth(),
+            strict_contact_priority: default_strict_contact_priority(),
+            contacts_only: false,
+            block_mode: false,
             log_level: default_log_level(),
         }
     }
@@ -253,6 +302,15 @@ fn default_chunk_size_mib() -> usize {
 }
 fn default_log_level() -> String {
     "warn".to_string()
+}
+fn default_max_concurrent_receives() -> usize {
+    3
+}
+fn default_max_queue_depth() -> usize {
+    8
+}
+fn default_strict_contact_priority() -> bool {
+    true
 }
 
 impl Config {
@@ -389,6 +447,25 @@ impl Config {
             self.chunk_size_mib = 1;
         }
 
+        // max_concurrent_receives: 0 would prevent any transfer from starting.
+        // Clamp to the minimum of 1.
+        if self.max_concurrent_receives == 0 {
+            warnings.push(
+                "max_concurrent_receives is 0 — clamped to 1 (the minimum usable value)."
+                    .to_string(),
+            );
+            self.max_concurrent_receives = 1;
+        }
+
+        // max_queue_depth: 0 would reject every offer instantly. Allow 1 as the
+        // tightest sane value (serve one, reject the rest).
+        if self.max_queue_depth == 0 {
+            warnings.push(
+                "max_queue_depth is 0 — clamped to 1 (the minimum usable value).".to_string(),
+            );
+            self.max_queue_depth = 1;
+        }
+
         warnings
     }
 }
@@ -403,6 +480,11 @@ mod tests {
         assert!(cfg.default_save_folder.is_none());
         assert!(!cfg.auto_accept_offers);
         assert!(!cfg.auto_accept_possible());
+        assert_eq!(cfg.max_concurrent_receives, 3);
+        assert_eq!(cfg.max_queue_depth, 8);
+        assert!(cfg.strict_contact_priority);
+        assert!(!cfg.contacts_only);
+        assert!(!cfg.block_mode);
     }
 
     #[test]
@@ -418,6 +500,11 @@ mod tests {
         assert_eq!(cfg.timeouts.endpoint_online_wait_secs, 30);
         assert!(cfg.notifications.enabled);
         assert_eq!(cfg.notifications.urgency, NotificationUrgency::Normal);
+        assert_eq!(cfg.max_concurrent_receives, 3);
+        assert_eq!(cfg.max_queue_depth, 8);
+        assert!(cfg.strict_contact_priority);
+        assert!(!cfg.contacts_only);
+        assert!(!cfg.block_mode);
     }
 
     #[test]
@@ -452,6 +539,14 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(cfg.heartbeat_interval(), Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn contacts_only_parses_from_yaml() {
+        let yaml = "contacts_only: true\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.contacts_only);
     }
 
     #[test]
@@ -584,6 +679,23 @@ mod tests {
         );
         assert_eq!(cfg.notifications.enabled, default.notifications.enabled);
         assert_eq!(cfg.notifications.urgency, default.notifications.urgency);
+        assert_eq!(
+            cfg.max_concurrent_receives, default.max_concurrent_receives,
+            "sample pins max_concurrent_receives"
+        );
+        assert_eq!(
+            cfg.max_queue_depth, default.max_queue_depth,
+            "sample pins max_queue_depth"
+        );
+        assert_eq!(
+            cfg.strict_contact_priority, default.strict_contact_priority,
+            "sample pins strict_contact_priority"
+        );
+        assert_eq!(
+            cfg.contacts_only, default.contacts_only,
+            "sample pins contacts_only"
+        );
+        assert_eq!(cfg.block_mode, default.block_mode, "sample pins block_mode");
     }
 
     #[cfg(feature = "balloon")]
@@ -698,5 +810,48 @@ mod tests {
             warnings.iter().any(|w| w.contains("not writable")),
             "expected a 'not writable' warning, got: {warnings:?}"
         );
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn validate_clamps_zero_concurrency_caps() {
+        let mut cfg = Config {
+            max_concurrent_receives: 0,
+            max_queue_depth: 0,
+            ..Config::default()
+        };
+        let warnings = cfg.validate();
+        assert_eq!(cfg.max_concurrent_receives, 1, "should be clamped to 1");
+        assert_eq!(cfg.max_queue_depth, 1, "should be clamped to 1");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("max_concurrent_receives")),
+            "expected a max_concurrent_receives warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("max_queue_depth")),
+            "expected a max_queue_depth warning, got: {warnings:?}"
+        );
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn partial_yaml_sets_concurrency_caps() {
+        let yaml = "max_concurrent_receives: 5\nmax_queue_depth: 16\nblock_mode: true\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.max_concurrent_receives, 5);
+        assert_eq!(cfg.max_queue_depth, 16);
+        assert!(cfg.block_mode);
+        // unspecified strict_contact_priority keeps its default
+        assert!(cfg.strict_contact_priority);
+    }
+
+    #[cfg(feature = "balloon")]
+    #[test]
+    fn strict_contact_priority_can_be_disabled() {
+        let yaml = "strict_contact_priority: false\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.strict_contact_priority);
     }
 }
